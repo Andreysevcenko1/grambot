@@ -22,6 +22,12 @@ def test_find_matching_cluster_returns_best_match():
     assert match == "cluster-1"
 
 
+def test_similarity_high_for_differently_phrased_same_event():
+    a = "TON Foundation confirms major network exploit, funds at risk"
+    b = "TON network exploit drains user funds, foundation confirms breach"
+    assert similarity(a, b) >= 0.45
+
+
 def test_find_matching_cluster_returns_none_when_no_match():
     candidates = [("cluster-1", "Completely unrelated headline about weather")]
     assert find_matching_cluster("TON network exploit", candidates) is None
