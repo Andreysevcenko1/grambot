@@ -47,3 +47,22 @@ def test_gram_keyword_ignores_weight_unit_and_matches_ticker():
     assert not is_relevant(negative, ["GRAM"])
     assert is_relevant(positive, ["GRAM"])
 
+
+
+def test_filter_fresh_drops_old_items():
+    from grambot.processing.filters import filter_fresh
+
+    now = 1_000_000.0
+    fresh = NewsItem(source="s", title="a", summary="", url=None, published_at=now - 3600)
+    stale = NewsItem(source="s", title="b", summary="", url=None, published_at=now - 48 * 3600)
+    assert filter_fresh([fresh, stale], max_age_hours=24, now=now) == [fresh]
+
+
+def test_multiword_keyword_matches_across_whitespace():
+    item = make_item("Grants from the TON   Foundation announced")
+    assert is_relevant(item, ["TON Foundation"])
+
+
+def test_ticker_with_dollar_prefix_matches():
+    item = make_item("$TON breaks out above resistance")
+    assert is_relevant(item, ["TON"])

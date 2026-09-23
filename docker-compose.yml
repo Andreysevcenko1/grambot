@@ -1,0 +1,33 @@
+services:
+  grambot:
+    build: .
+    container_name: grambot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /data/grambot.db
+    volumes:
+      - grambot-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: your own RSSHub instance for Telegram channels (and X, Reddit…).
+  # Start with:  docker compose --profile rsshub up -d
+  # Then point RSS_FEEDS at http://rsshub:1200/telegram/channel/<name>
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: grambot-rsshub
+    profiles: ["rsshub"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: memory
+      CACHE_EXPIRE: "300"
+    ports:
+      - "127.0.0.1:1200:1200"
+
+volumes:
+  grambot-data:

@@ -31,10 +31,11 @@ _SYSTEM_PROMPT = (
     "classify its likely short-term market impact. Respond ONLY with a "
     "compact JSON object with exactly these keys: "
     '{"sentiment": "positive"|"negative"|"neutral"|"unknown", '
-    '"strength": "low"|"medium"|"high"}. '
+    '"strength": "low"|"medium"|"high", "reason": "<= 12 words in Russian"}. '
     "Use \"unknown\" sentiment when the impact is genuinely unclear or "
-    "mixed, and prefer lower strength when uncertain. Do not include any "
-    "explanation, markdown, or extra text -- JSON only."
+    "mixed, and prefer lower strength when uncertain. Rebrands, price "
+    "recaps and opinion pieces are neutral. Do not include markdown or any "
+    "text outside the JSON object."
 )
 
 
@@ -76,7 +77,7 @@ class LLMClassifier:
                     {"role": "user", "content": text[:4000]},
                 ],
                 "temperature": 0,
-                "max_tokens": 50,
+                "max_tokens": 120,
             },
             timeout=self.timeout,
         )
@@ -85,8 +86,9 @@ class LLMClassifier:
         content = payload["choices"][0]["message"]["content"].strip()
         parsed = _parse_json_object(content)
 
-        sentiment = parsed.get("sentiment", "unknown")
-        strength = parsed.get("strength", "low")
+        sentiment = str(parsed.get("sentiment", "unknown")).lower()
+        strength = str(parsed.get("strength", "low")).lower()
+        reason = str(parsed.get("reason", "") or "").strip()[:200]
 
         if sentiment not in _VALID_SENTIMENTS:
             sentiment = "unknown"
@@ -95,7 +97,7 @@ class LLMClassifier:
 
         # The LLM path doesn't produce matched keywords; keep the field for
         # interface compatibility but leave it empty.
-        return Classification(sentiment=sentiment, strength=strength, matched_keywords=[])
+        return Classification(sentiment=sentiment, strength=strength, matched_keywords=[], reason=reason)
 
 
 def _parse_json_object(content: str) -> dict:

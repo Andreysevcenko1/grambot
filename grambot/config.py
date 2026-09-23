@@ -1,13 +1,23 @@
 """Configuration loading for the GRAM/TON monitor bot."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 try:  # pragma: no cover - exercised indirectly
     from dotenv import load_dotenv
 
+    # Load the project's .env explicitly so the bot finds it regardless of the
+    # working directory it was launched from (launchd, cron, IDE), then fall
+    # back to the cwd. Already-set environment variables always take priority.
+    load_dotenv(PROJECT_ROOT / ".env")
     load_dotenv()
 except ImportError:  # pragma: no cover - dotenv is an optional convenience
     pass
@@ -15,6 +25,40 @@ except ImportError:  # pragma: no cover - dotenv is an optional convenience
 
 def _split_csv(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw = os.getenv(name)
+    return _split_csv(raw) if raw else list(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r, using default %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError:
+        logger.warning("Invalid number for %s=%r, using default %s", name, raw, default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 DEFAULT_RSS_FEEDS = [
@@ -39,6 +83,17 @@ DEFAULT_KEYWORDS = [
     "Telegram",
     "The Open Network",
     "TON Foundation",
+    "Durov",
+]
+
+# Items whose source name contains one of these (case-insensitive) are treated
+# as first-party/official and count as verified on their own, without waiting
+# for a second outlet to corroborate them.
+DEFAULT_TRUSTED_SOURCES = [
+    "The Open Network - Telegram Channel",
+    "TON Status - Telegram Channel",
+    "Pavel Durov - Telegram Channel",
+    "Telegram News - Telegram Channel",
 ]
 
 
@@ -48,12 +103,23 @@ class Settings:
     telegram_chat_id: str = ""
     rss_feeds: List[str] = field(default_factory=lambda: list(DEFAULT_RSS_FEEDS))
     keywords: List[str] = field(default_factory=lambda: list(DEFAULT_KEYWORDS))
+    trusted_sources: List[str] = field(default_factory=lambda: list(DEFAULT_TRUSTED_SOURCES))
     poll_interval_seconds: int = 300
     price_poll_interval_seconds: int = 120
+    feed_timeout_seconds: int = 15
+    max_item_age_hours: int = 24
     min_notify_strength: str = "low"
     cluster_window_minutes: int = 120
     min_sources_for_verified: int = 2
+    max_notifications_per_hour: int = 10
+    price_window_minutes: int = 20
+    price_alert_threshold_pct: float = 5.0
+    price_alert_cooldown_minutes: int = 60
+    retention_days: int = 30
+    enable_commands: bool = True
+    send_startup_message: bool = True
     coingecko_coin_id: str = "the-open-network"
+    price_symbol: str = "GRAMUSDT"
     database_path: str = "grambot.db"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -61,23 +127,30 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        rss_feeds_env = os.getenv("RSS_FEEDS")
-        keywords_env = os.getenv("KEYWORDS")
         return cls(
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
-            rss_feeds=_split_csv(rss_feeds_env) if rss_feeds_env else list(DEFAULT_RSS_FEEDS),
-            keywords=_split_csv(keywords_env) if keywords_env else list(DEFAULT_KEYWORDS),
-            poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "300")),
-            price_poll_interval_seconds=int(
-                os.getenv("PRICE_POLL_INTERVAL_SECONDS", "120")
-            ),
-            min_notify_strength=os.getenv("MIN_NOTIFY_STRENGTH", "low"),
-            cluster_window_minutes=int(os.getenv("CLUSTER_WINDOW_MINUTES", "120")),
-            min_sources_for_verified=int(os.getenv("MIN_SOURCES_FOR_VERIFIED", "2")),
-            coingecko_coin_id=os.getenv("COINGECKO_COIN_ID", "the-open-network"),
-            database_path=os.getenv("DATABASE_PATH", "grambot.db"),
-            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            rss_feeds=_env_list("RSS_FEEDS", DEFAULT_RSS_FEEDS),
+            keywords=_env_list("KEYWORDS", DEFAULT_KEYWORDS),
+            trusted_sources=_env_list("TRUSTED_SOURCES", DEFAULT_TRUSTED_SOURCES),
+            poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 300)),
+            price_poll_interval_seconds=max(30, _env_int("PRICE_POLL_INTERVAL_SECONDS", 120)),
+            feed_timeout_seconds=max(3, _env_int("FEED_TIMEOUT_SECONDS", 15)),
+            max_item_age_hours=max(1, _env_int("MAX_ITEM_AGE_HOURS", 24)),
+            min_notify_strength=os.getenv("MIN_NOTIFY_STRENGTH", "low").strip().lower() or "low",
+            cluster_window_minutes=max(1, _env_int("CLUSTER_WINDOW_MINUTES", 120)),
+            min_sources_for_verified=max(1, _env_int("MIN_SOURCES_FOR_VERIFIED", 2)),
+            max_notifications_per_hour=max(1, _env_int("MAX_NOTIFICATIONS_PER_HOUR", 10)),
+            price_window_minutes=max(1, _env_int("PRICE_WINDOW_MINUTES", 20)),
+            price_alert_threshold_pct=max(0.1, _env_float("PRICE_ALERT_THRESHOLD_PCT", 5.0)),
+            price_alert_cooldown_minutes=max(0, _env_int("PRICE_ALERT_COOLDOWN_MINUTES", 60)),
+            retention_days=max(1, _env_int("RETENTION_DAYS", 30)),
+            enable_commands=_env_bool("ENABLE_COMMANDS", True),
+            send_startup_message=_env_bool("SEND_STARTUP_MESSAGE", True),
+            coingecko_coin_id=os.getenv("COINGECKO_COIN_ID", "the-open-network").strip() or "the-open-network",
+            price_symbol=os.getenv("PRICE_SYMBOL", "GRAMUSDT").strip().upper() or "GRAMUSDT",
+            database_path=os.getenv("DATABASE_PATH", "grambot.db").strip() or "grambot.db",
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
         )
