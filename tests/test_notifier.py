@@ -87,3 +87,15 @@ def test_notifier_dry_run_when_not_configured():
     assert not notifier.is_configured
     assert notifier.send("hello") is True
     assert notifier.get_updates(None) == []
+
+
+def test_price_context_shows_display_currency_next_to_usd():
+    from grambot.notifier import fmt_price, format_price_context
+
+    move = make_move(price_usd=1.406, local_currency="EUR", local_price=1.2277)
+    line = format_price_context(move)[0]
+    assert line.startswith("TON: $1,406 (≈ 1,228 €)")
+    usd_only = format_price_context(make_move(price_usd=1.406))[0]
+    assert "≈" not in usd_only
+    assert fmt_price(119.02, "RUB") == "119,02 ₽"
+    assert fmt_price(1.5, "CHF") == "1,500 CHF"

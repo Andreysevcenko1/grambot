@@ -192,10 +192,14 @@ class CommandHandler(threading.Thread):
     def cmd_price(self, args: List[str]) -> str:
         move = self.monitor.poll_price(alert=False)
         if move is None:
-            move = price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+            move = self.monitor._localize(
+                price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+            )
         if move is None:
             return "Данные о цене пока недоступны."
         lines = ["💰 <b>TON / GRAM</b>"] + format_price_context(move)
+        provider = self.monitor.price_client.last_provider or move.provider
+        lines.append(f"<i>Источник: {html.escape(provider)} · {fmt_time(time.time())}</i>")
         return "\n".join(lines)
 
     def cmd_recent(self, args: List[str]) -> str:
@@ -267,7 +271,7 @@ class CommandHandler(threading.Thread):
         classification = Classification(
             sentiment="negative", strength="high", matched_keywords=["сбой"], reason="сбой, TON Foundation"
         )
-        move = price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+        move = self.monitor.current_price_move()
         return format_news_alert(item, classification, source_count=3, sources=["Тест", "Cointelegraph", "Decrypt"], price_move=move)
 
     def cmd_mute(self, args: List[str]) -> str:

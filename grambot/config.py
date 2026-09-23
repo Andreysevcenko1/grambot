@@ -61,6 +61,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_currency(name: str, default: str) -> str:
+    raw = (os.getenv(name) or "").strip().upper()
+    if len(raw) == 3 and raw.isalpha():
+        return raw
+    if raw:
+        logger.warning("%s=%r is not a 3-letter currency code; using %s", name, raw, default)
+    return default
+
+
 DEFAULT_RSS_FEEDS = [
     "https://news.google.com/rss/search?q=TON+OR+Toncoin+OR+GRAM+OR+%22The+Open+Network%22&hl=en-US&gl=US&ceid=US:en",
     "https://cointelegraph.com/rss",
@@ -120,6 +129,7 @@ class Settings:
     send_startup_message: bool = True
     coingecko_coin_id: str = "the-open-network"
     price_symbol: str = "GRAMUSDT"
+    display_currency: str = "USD"
     database_path: str = "grambot.db"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -149,6 +159,7 @@ class Settings:
             send_startup_message=_env_bool("SEND_STARTUP_MESSAGE", True),
             coingecko_coin_id=os.getenv("COINGECKO_COIN_ID", "the-open-network").strip() or "the-open-network",
             price_symbol=os.getenv("PRICE_SYMBOL", "GRAMUSDT").strip().upper() or "GRAMUSDT",
+            display_currency=_env_currency("DISPLAY_CURRENCY", "USD"),
             database_path=os.getenv("DATABASE_PATH", "grambot.db").strip() or "grambot.db",
             openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),

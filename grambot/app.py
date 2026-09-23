@@ -55,8 +55,16 @@ class GramTonMonitor:
         self._price_lock = threading.Lock()
         self._trusted = [s.lower() for s in settings.trusted_sources if s.strip()]
         self.price_client = price_module.PriceClient(
-            coin_id=settings.coingecko_coin_id, symbol=settings.price_symbol
+            coin_id=settings.coingecko_coin_id,
+            symbol=settings.price_symbol,
+            display_currency=settings.display_currency,
         )
+        self.fiat_rates = price_module.FiatRates()
+
+    def _localize(self, move: Optional[PriceMove]) -> Optional[PriceMove]:
+        if move is None:
+            return None
+        return price_module.with_local_currency(move, self.settings.display_currency, self.fiat_rates)
 
     # -- control ---------------------------------------------------------
     def request_poll(self) -> None:
@@ -199,6 +207,7 @@ class GramTonMonitor:
                 provider=snapshot.provider,
             )
             self.last_price_poll_at = snapshot.fetched_at
+        move = self._localize(move)
         if alert:
             self._maybe_price_alert(move)
         return move
@@ -234,7 +243,9 @@ class GramTonMonitor:
         latest = self.storage.latest_price()
         max_age = 2 * self.settings.price_poll_interval_seconds
         if latest and time.time() - latest.fetched_at <= max_age:
-            return price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+            return self._localize(
+                price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+            )
         return self.poll_price(alert=False)
 
     def update_signal_followups(self) -> int:

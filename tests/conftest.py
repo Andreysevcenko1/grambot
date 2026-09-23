@@ -2,9 +2,11 @@ import os
 import tempfile
 import time
 from typing import List
+from unittest.mock import patch
 
 import pytest
 
+from grambot import price as price_module
 from grambot.app import GramTonMonitor
 from grambot.config import Settings
 from grambot.processing.classifier import RuleBasedClassifier
@@ -90,7 +92,12 @@ def monitor():
         source = FakeSource()
         notifier = FakeNotifier()
         mon = GramTonMonitor(settings, storage, source, RuleBasedClassifier(), notifier, classifier_name="test")
-        try:
-            yield mon
-        finally:
-            storage.close()
+        # Never hit the network from tests: price providers return nothing
+        # unless a test patches them itself; fiat rates are fixed.
+        with patch.object(price_module.PriceClient, "fetch", return_value=None), patch.object(
+            price_module.FiatRates, "get", side_effect=lambda cur: 1.0 if cur == "USD" else 0.9
+        ):
+            try:
+                yield mon
+            finally:
+                storage.close()

@@ -72,3 +72,12 @@ def test_price_command_falls_back_to_history(monitor):
         assert "недоступны" in handler.handle_command("/price")
         monitor.storage.add_price_point(2.5, 100.0, change_24h_pct=1.0, fetched_at=time.time())
         assert "$2,500" in handler.handle_command("/price")
+
+
+def test_price_command_shows_local_currency_and_provider(monitor):
+    monitor.settings.display_currency = "EUR"
+    handler = handler_for(monitor)
+    monitor.storage.add_price_point(2.0, 100.0, change_24h_pct=1.0, fetched_at=time.time())
+    text = handler.handle_command("/price")
+    assert "$2,000 (≈ 1,800 €)" in text
+    assert "Источник:" in text

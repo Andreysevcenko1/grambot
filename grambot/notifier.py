@@ -28,6 +28,11 @@ SENTIMENT_HEADERS = {
 }
 STRENGTH_LABELS = {"low": "низкая", "medium": "средняя", "high": "высокая"}
 DISCLAIMER = "ℹ️ Информационный сигнал, не финансовая рекомендация."
+CURRENCY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "RUB": "₽", "UAH": "₴", "KZT": "₸", "GBP": "£",
+    "BYN": "Br", "TRY": "₺", "PLN": "zł", "CZK": "Kč", "GEL": "₾", "AMD": "֏",
+    "JPY": "¥", "CNY": "¥", "KRW": "₩", "INR": "₹", "BRL": "R$", "ILS": "₪",
+}
 
 
 def fmt_pct(value: Optional[float], digits: int = 1) -> str:
@@ -49,9 +54,23 @@ def fmt_usd(value: Optional[float]) -> str:
     return f"${value:.4f}".replace(".", ",")
 
 
-def fmt_price(value: float) -> str:
+def fmt_price(value: float, currency: str = "USD") -> str:
     digits = 4 if value < 1 else (3 if value < 10 else 2)
-    return f"${value:.{digits}f}".replace(".", ",")
+    number = f"{value:.{digits}f}".replace(".", ",")
+    symbol = CURRENCY_SYMBOLS.get(currency.upper())
+    if currency.upper() == "USD":
+        return f"${number}"
+    if symbol:
+        return f"{number} {symbol}"
+    return f"{number} {currency.upper()}"
+
+
+def fmt_price_move(move: PriceMove) -> str:
+    """USD price plus the display-currency equivalent when configured."""
+    text = fmt_price(move.price_usd)
+    if move.local_price is not None and move.local_currency.upper() != "USD":
+        text += f" (≈ {fmt_price(move.local_price, move.local_currency)})"
+    return text
 
 
 def fmt_ratio(value: Optional[float]) -> str:
@@ -73,7 +92,7 @@ def truncate(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
 def format_price_context(move: Optional[PriceMove]) -> List[str]:
     if move is None:
         return []
-    parts = [f"TON: {fmt_price(move.price_usd)}"]
+    parts = [f"TON: {fmt_price_move(move)}"]
     if move.window_change_pct is not None:
         parts.append(f"{fmt_pct(move.window_change_pct)} за {move.window_minutes} мин")
     if move.change_24h_pct is not None:

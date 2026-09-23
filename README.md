@@ -108,6 +108,15 @@ docker compose --profile rsshub up -d   # + собственный RSSHub для
 и Reddit (`/twitter/user/<name>`, `/reddit/subreddit/<name>`), если инстанс
 настроен с нужными ключами.
 
+## Цена и валюта
+
+Цена берётся с CoinGecko, при лимите/сбое — с Binance → Bybit → OKX (пара
+`PRICE_SYMBOL`, по умолчанию `GRAMUSDT`). Все биржи торгуют к USDT, поэтому
+базовая цена и история — в долларах. Если вы смотрите цену в другой валюте
+(например, в кошельке Telegram в евро), задайте `DISPLAY_CURRENCY=EUR` (RUB,
+UAH, KZT, GBP…): бот покажет `TON: $1,406 (≈ 1,23 €)`. Курс берётся рыночный
+(USDT через CoinGecko), при сбое — open.er-api.com → frankfurter.dev; кэш на час.
+
 ## LLM-классификация (необязательно)
 
 Задайте `OPENAI_API_KEY` (и при желании `OPENAI_BASE_URL` / `OPENAI_MODEL` —

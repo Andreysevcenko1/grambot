@@ -24,8 +24,11 @@ COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers"
 OKX_URL = "https://www.okx.com/api/v5/market/ticker"
+ERAPI_URL = "https://open.er-api.com/v6/latest/USD"
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
 
 DEFAULT_BACKOFF_SECONDS = 300.0
+FIAT_RATE_TTL_SECONDS = 3600.0
 
 
 @dataclass
@@ -35,6 +38,8 @@ class PriceSnapshot:
     change_24h_pct: Optional[float]
     fetched_at: float
     provider: str = "coingecko"
+    local_currency: Optional[str] = None  # set when the provider quoted this currency directly
+    local_price: Optional[float] = None
 
 
 @dataclass
@@ -46,6 +51,8 @@ class PriceMove:
     volume_24h_usd: float
     volume_ratio_vs_yesterday: Optional[float]  # today's 24h volume / 24h volume a day ago
     provider: str = "coingecko"
+    local_currency: str = "USD"  # display currency (DISPLAY_CURRENCY); history stays in USD
+    local_price: Optional[float] = None  # price converted to ``local_currency`` when it is not USD
 
 
 class RateLimited(Exception):
@@ -70,10 +77,19 @@ def _get(url: str, params: dict, timeout: float) -> requests.Response:
     return response
 
 
-def fetch_coingecko(coin_id: str, timeout: float = 10.0) -> Optional[PriceSnapshot]:
+def fetch_coingecko(coin_id: str, timeout: float = 10.0, currency: Optional[str] = None) -> Optional[PriceSnapshot]:
+    """``currency`` (e.g. ``EUR``) is quoted in the same request when it is not USD."""
+    local = (currency or "USD").upper()
+    vs_currencies = "usd" if local == "USD" else f"usd,{local.lower()}"
     payload = _get(
         COINGECKO_URL,
-        {"ids": coin_id, "vs_currencies": "usd", "include_24hr_vol": "true", "include_24hr_change": "true"},
+        {
+            "ids": coin_id,
+            "vs_currencies": vs_currencies,
+            "include_24hr_vol": "true",
+            "include_24hr_change": "true",
+            "precision": "full",  # default rounds e.g. 1.4034 -> 1.4
+        },
         timeout,
     ).json()
     if not isinstance(payload, dict):
@@ -85,12 +101,15 @@ def fetch_coingecko(coin_id: str, timeout: float = 10.0) -> Optional[PriceSnapsh
         logger.warning("CoinGecko returned no data for %s: %r", coin_id, payload)
         return None
     change = data.get("usd_24h_change")
+    local_price = data.get(local.lower()) if local != "USD" else None
     return PriceSnapshot(
         price_usd=float(data["usd"]),
         volume_24h_usd=float(data.get("usd_24h_vol") or 0.0),
         change_24h_pct=float(change) if change is not None else None,
         fetched_at=time.time(),
         provider="coingecko",
+        local_currency=local if local_price else None,
+        local_price=float(local_price) if local_price else None,
     )
 
 
@@ -149,17 +168,24 @@ def fetch_okx(symbol: str, timeout: float = 10.0) -> Optional[PriceSnapshot]:
 class PriceClient:
     """Tries providers in order, remembering rate-limit backoffs per provider."""
 
-    def __init__(self, coin_id: str = "the-open-network", symbol: str = "GRAMUSDT", timeout: float = 10.0):
+    def __init__(
+        self,
+        coin_id: str = "the-open-network",
+        symbol: str = "GRAMUSDT",
+        timeout: float = 10.0,
+        display_currency: str = "USD",
+    ):
         self.coin_id = coin_id
         self.symbol = symbol
         self.timeout = timeout
+        self.display_currency = (display_currency or "USD").upper()
         self.backoff_until: Dict[str, float] = {}
         self.last_provider: Optional[str] = None
         self.last_error: Optional[str] = None
 
     def providers(self) -> List[Tuple[str, Callable[[], Optional[PriceSnapshot]]]]:
         return [
-            ("coingecko", lambda: fetch_coingecko(self.coin_id, self.timeout)),
+            ("coingecko", lambda: fetch_coingecko(self.coin_id, self.timeout, self.display_currency)),
             ("binance", lambda: fetch_binance(self.symbol, self.timeout)),
             ("bybit", lambda: fetch_bybit(self.symbol, self.timeout)),
             ("okx", lambda: fetch_okx(self.symbol, self.timeout)),
@@ -195,6 +221,98 @@ def fetch_price(coin_id: str, timeout: float = 10.0) -> Optional[PriceSnapshot]:
     return PriceClient(coin_id=coin_id, timeout=timeout).fetch()
 
 
+# -- fiat conversion (display only) -----------------------------------------
+def fetch_rate_erapi(currency: str, timeout: float) -> Optional[float]:
+    data = _get(ERAPI_URL, {}, timeout).json()
+    if data.get("result") != "success":
+        raise ValueError(data.get("error-type") or "er-api error")
+    rate = data.get("rates", {}).get(currency)
+    return float(rate) if rate else None
+
+
+def fetch_rate_frankfurter(currency: str, timeout: float) -> Optional[float]:
+    data = _get(FRANKFURTER_URL, {"base": "USD", "symbols": currency}, timeout).json()
+    rate = data.get("rates", {}).get(currency)
+    return float(rate) if rate else None
+
+
+def fetch_rate_coingecko_usdt(currency: str, timeout: float) -> Optional[float]:
+    """Market rate via USDT (what crypto wallets/exchanges usually show)."""
+    data = _get(
+        COINGECKO_URL, {"ids": "tether", "vs_currencies": currency.lower(), "precision": "full"}, timeout
+    ).json()
+    rate = data.get("tether", {}).get(currency.lower())
+    return float(rate) if rate else None
+
+
+class FiatRates:
+    """USD -> fiat rates for display, cached for ``ttl`` seconds per currency."""
+
+    def __init__(self, timeout: float = 10.0, ttl: float = FIAT_RATE_TTL_SECONDS):
+        self.timeout = timeout
+        self.ttl = ttl
+        self._cache: Dict[str, Tuple[float, float]] = {}  # currency -> (rate, fetched_at)
+        self.last_error: Optional[str] = None
+
+    def providers(self) -> List[Tuple[str, Callable[[str, float], Optional[float]]]]:
+        # Market USDT rate first: wallets/exchanges price fiat that way, and the
+        # hourly cache keeps CoinGecko calls rare. Central-bank feeds are backups.
+        return [
+            ("coingecko-usdt", fetch_rate_coingecko_usdt),
+            ("er-api", fetch_rate_erapi),
+            ("frankfurter", fetch_rate_frankfurter),
+        ]
+
+    def observe(self, currency: str, rate: float) -> None:
+        """Record a rate implied by a provider quote (no network call)."""
+        if rate > 0:
+            self._cache[currency.upper()] = (rate, time.time())
+
+    def get(self, currency: str) -> Optional[float]:
+        currency = currency.upper()
+        if currency == "USD":
+            return 1.0
+        cached = self._cache.get(currency)
+        now = time.time()
+        if cached and now - cached[1] < self.ttl:
+            return cached[0]
+        for name, fetcher in self.providers():
+            try:
+                rate = fetcher(currency, self.timeout)
+            except (requests.RequestException, RateLimited, ValueError, TypeError, KeyError) as exc:
+                self.last_error = f"{name}: {exc}"
+                logger.info("Fiat rate provider %s failed: %s", name, exc)
+                continue
+            if rate and rate > 0:
+                self._cache[currency] = (rate, now)
+                self.last_error = None
+                return rate
+        if cached:  # stale but better than nothing
+            return cached[0]
+        logger.warning("No USD->%s rate available (%s)", currency, self.last_error)
+        return None
+
+
+def with_local_currency(move: PriceMove, currency: str, rates: FiatRates) -> PriceMove:
+    """Attach the display-currency price to ``move`` (history stays in USD).
+
+    A price quoted directly by the provider in that currency wins and also
+    refreshes the cached rate, so exchange fallbacks convert consistently.
+    """
+    currency = (currency or "USD").upper()
+    if currency == "USD":
+        move.local_currency = "USD"
+        move.local_price = None
+        return move
+    if move.local_currency == currency and move.local_price and move.price_usd > 0:
+        rates.observe(currency, move.local_price / move.price_usd)
+        return move
+    rate = rates.get(currency)
+    move.local_currency = currency
+    move.local_price = move.price_usd * rate if rate else None
+    return move
+
+
 def pct_change(current: float, previous: Optional[float]) -> Optional[float]:
     if previous is None or previous <= 0:
         return None
@@ -225,6 +343,8 @@ def compute_move(storage: Storage, snapshot: PriceSnapshot, window_minutes: int)
         volume_24h_usd=snapshot.volume_24h_usd,
         volume_ratio_vs_yesterday=volume_ratio,
         provider=snapshot.provider,
+        local_currency=snapshot.local_currency or "USD",
+        local_price=snapshot.local_price,
     )
 
 

@@ -124,3 +124,80 @@ def test_compute_move_without_history(storage):
     assert move.volume_ratio_vs_yesterday is None
     assert not price.is_spike(move, 1.0)
     assert price.move_from_history(storage, 20) is None
+
+
+# -- fiat conversion ---------------------------------------------------------
+def test_fiat_rates_use_market_usdt_rate_first_and_cache():
+    with patch("grambot.price.requests.get", return_value=_Resp({"tether": {"eur": 0.8778}})) as get:
+        rates = price.FiatRates()
+        assert rates.get("EUR") == 0.8778
+        assert rates.get("eur") == 0.8778  # cached, case-insensitive
+        assert rates.get("USD") == 1.0
+    assert get.call_count == 1
+    assert get.call_args.kwargs["params"] == {"ids": "tether", "vs_currencies": "eur", "precision": "full"}
+
+
+def test_fiat_rates_fall_back_to_erapi_then_frankfurter():
+    def responder(url, **kw):
+        if url == price.COINGECKO_URL:
+            return _Resp({}, status_code=429, headers={"Retry-After": "60"})
+        if url == price.ERAPI_URL:
+            return _Resp({"result": "success", "rates": {"EUR": 0.8732}})
+        raise AssertionError(url)
+
+    with patch("grambot.price.requests.get", side_effect=responder):
+        assert price.FiatRates().get("EUR") == 0.8732
+
+    def only_frankfurter(url, **kw):
+        if url == price.FRANKFURTER_URL:
+            return _Resp({"base": "USD", "rates": {"RUB": 84.18}})
+        raise requests.ConnectionError("down")
+
+    with patch("grambot.price.requests.get", side_effect=only_frankfurter):
+        assert price.FiatRates().get("RUB") == 84.18
+
+
+def test_fiat_rates_return_stale_cache_when_all_providers_fail():
+    rates = price.FiatRates(ttl=0.0)
+    with patch("grambot.price.requests.get", return_value=_Resp({"tether": {"eur": 0.9}})):
+        assert rates.get("EUR") == 0.9
+    with patch("grambot.price.requests.get", side_effect=requests.ConnectionError("offline")):
+        assert rates.get("EUR") == 0.9  # stale value re-used
+        assert price.FiatRates().get("EUR") is None  # nothing cached -> None
+
+
+def test_with_local_currency_converts_only_non_usd():
+    move = price.PriceMove(1.406, 20, None, -3.0, 6.3e7, None)
+    rates = price.FiatRates()
+    rates._cache["EUR"] = (0.8732, time.time())
+    price.with_local_currency(move, "eur", rates)
+    assert move.local_currency == "EUR"
+    assert round(move.local_price, 3) == 1.228
+    price.with_local_currency(move, "USD", rates)
+    assert move.local_currency == "USD" and move.local_price is None
+
+
+def test_coingecko_quotes_display_currency_in_same_request():
+    payload = {"the-open-network": {"usd": 1.4034, "eur": 1.2324, "usd_24h_vol": 6.3e7, "usd_24h_change": -3.0}}
+    with patch("grambot.price.requests.get", return_value=_Resp(payload)) as get:
+        snap = price.PriceClient(display_currency="eur").fetch()
+    assert get.call_args.kwargs["params"]["vs_currencies"] == "usd,eur"
+    assert snap.local_currency == "EUR" and snap.local_price == 1.2324
+
+    with patch("grambot.price.requests.get", return_value=_Resp(payload)) as get:
+        snap = price.PriceClient().fetch()
+    assert get.call_args.kwargs["params"]["vs_currencies"] == "usd"
+    assert snap.local_currency is None and snap.local_price is None
+
+
+def test_quoted_local_price_wins_and_seeds_rate_cache(storage):
+    snap = price.PriceSnapshot(1.4034, 6.3e7, -3.0, time.time(), local_currency="EUR", local_price=1.2324)
+    move = price.compute_move(storage, snap, 20)
+    rates = price.FiatRates()
+    with patch("grambot.price.requests.get", side_effect=AssertionError("no network expected")):
+        price.with_local_currency(move, "EUR", rates)
+        assert move.local_price == 1.2324
+        # An exchange snapshot (USD only) now converts with the implied rate.
+        binance = price.PriceSnapshot(1.406, 1.4e7, -2.8, time.time(), provider="binance")
+        move2 = price.with_local_currency(price.compute_move(storage, binance, 20), "EUR", rates)
+    assert round(move2.local_price, 4) == round(1.406 * 1.2324 / 1.4034, 4)
