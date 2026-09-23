@@ -23,6 +23,13 @@ DEFAULT_RSS_FEEDS = [
     "https://decrypt.co/feed",
     "https://cryptoslate.com/feed/",
     "https://www.theblock.co/rss.xml",
+    # Telegram channels via a public RSSHub instance. Public bridges can be
+    # rate-limited or go offline; self-host RSSHub (see README) for
+    # reliability and replace the base URL below with your own instance.
+    "https://rsshub.rssforever.com/telegram/channel/tonblockchain",
+    "https://rsshub.rssforever.com/telegram/channel/tonstatus",
+    "https://rsshub.rssforever.com/telegram/channel/durov",
+    "https://rsshub.rssforever.com/telegram/channel/telegram",
 ]
 
 DEFAULT_KEYWORDS = [
@@ -48,6 +55,9 @@ class Settings:
     min_sources_for_verified: int = 2
     coingecko_coin_id: str = "the-open-network"
     database_path: str = "grambot.db"
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,4 +77,7 @@ class Settings:
             min_sources_for_verified=int(os.getenv("MIN_SOURCES_FOR_VERIFIED", "2")),
             coingecko_coin_id=os.getenv("COINGECKO_COIN_ID", "the-open-network"),
             database_path=os.getenv("DATABASE_PATH", "grambot.db"),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         )

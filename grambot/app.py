@@ -10,14 +10,32 @@ from typing import List
 from .config import Settings
 from .notifier import TelegramNotifier, format_message
 from .price import poll_and_store, recent_move
-from .processing.classifier import RuleBasedClassifier, meets_min_strength
+from .processing.classifier import Classifier, RuleBasedClassifier, meets_min_strength
 from .processing.clustering import find_matching_cluster, new_cluster_id
 from .processing.filters import filter_relevant
+from .processing.llm_classifier import LLMClassifier
 from .sources import NewsItem
 from .sources.rss import fetch_all
 from .storage import Storage
 
 logger = logging.getLogger(__name__)
+
+
+def build_classifier(settings: Settings) -> Classifier:
+    """Pick an LLM-backed classifier when an API key is configured, falling
+    back to the deterministic rule-based classifier otherwise (and on any
+    runtime failure -- see `LLMClassifier.classify`).
+    """
+    if settings.openai_api_key:
+        logger.info("Using LLM classifier (model=%s)", settings.openai_model)
+        return LLMClassifier(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            model=settings.openai_model,
+            fallback=RuleBasedClassifier(),
+        )
+    logger.info("Using rule-based classifier (set OPENAI_API_KEY to enable LLM classification)")
+    return RuleBasedClassifier()
 
 
 class GramTonMonitor:
@@ -27,7 +45,7 @@ class GramTonMonitor:
         self.settings = settings
         self.storage = storage
         self.notifier = notifier
-        self.classifier = RuleBasedClassifier()
+        self.classifier = build_classifier(settings)
 
     def poll_price(self) -> None:
         poll_and_store(self.storage, self.settings.coingecko_coin_id)

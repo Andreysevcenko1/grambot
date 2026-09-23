@@ -17,14 +17,19 @@ wrong; always verify via the linked source before acting.
    Nitter), so no platform is scraped directly.
 2. **Filter** — keep only items mentioning configured keywords (`KEYWORDS`,
    e.g. `TON, Toncoin, GRAM, Telegram`).
-3. **Classify** — a rule-based classifier (`grambot/processing/classifier.py`)
-   estimates sentiment (positive/negative/neutral/unknown) and signal
-   strength (low/medium/high) from keyword patterns. It's a small, swappable
-   interface so an LLM-backed classifier can replace it later.
+3. **Classify** — sentiment (positive/negative/neutral/unknown) and signal
+   strength (low/medium/high) estimation. Uses a deterministic rule-based
+   classifier by default (`grambot/processing/classifier.py`, no API key
+   needed); if `OPENAI_API_KEY` is set, an LLM-backed classifier
+   (`grambot/processing/llm_classifier.py`, any OpenAI-compatible endpoint)
+   is used instead, with automatic fallback to the rule-based classifier on
+   any API error.
 4. **Cluster & verify** — near-duplicate headlines within a time window are
-   grouped (`grambot/processing/clustering.py`); a signal is only sent once
-   it's corroborated by `MIN_SOURCES_FOR_VERIFIED` independent sources,
-   otherwise it's treated as an unverified rumor and suppressed.
+   grouped (`grambot/processing/clustering.py`) using both character-level
+   similarity and significant-word overlap, so differently phrased reports
+   of the same event from different outlets still match. A signal is only
+   sent once it's corroborated by `MIN_SOURCES_FOR_VERIFIED` independent
+   sources, otherwise it's treated as an unverified rumor and suppressed.
 5. **Price context** — `grambot/price.py` polls CoinGecko for TON
    price/volume and computes the recent % move using locally stored
    history.
@@ -57,6 +62,53 @@ This starts an infinite poll loop: fetches news on `POLL_INTERVAL_SECONDS`,
 polls TON price on `PRICE_POLL_INTERVAL_SECONDS`, and sends Telegram
 notifications for verified, sufficiently strong signals.
 
+### Run persistently in the background (macOS)
+
+To keep the bot running after closing the terminal, and to have it restart
+automatically on crash or login, install it as a launchd user agent:
+
+```bash
+./scripts/install_launchd.sh
+```
+
+Logs go to `grambot.log` in the project directory. Manage it with:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.grambot.monitor.plist   # stop
+launchctl load -w ~/Library/LaunchAgents/com.grambot.monitor.plist  # start
+./scripts/uninstall_launchd.sh                                      # remove
+```
+
+## LLM-backed classification (optional)
+
+By default the bot uses a free, deterministic keyword classifier. To use an
+LLM for better judgement, set in `.env`:
+
+```
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1   # or any OpenAI-compatible endpoint
+OPENAI_MODEL=gpt-4o-mini
+```
+
+If the API key is missing, or any request fails, the bot automatically
+falls back to the rule-based classifier — it never blocks notifications
+because of an LLM outage.
+
+## Telegram channel / X (Twitter) sources
+
+RSS_FEEDS supports Telegram channels and X/Twitter accounts via RSS bridges
+(RSSHub for Telegram, Nitter for X), which avoids scraping either platform
+directly. The default feeds include a few TON-related Telegram channels via
+a public RSSHub instance. Public bridge instances can be rate-limited or go
+offline; for reliability, self-host your own:
+
+```bash
+docker run -d --name rsshub -p 1200:1200 diygod/rsshub
+```
+
+Then point feed URLs at `http://localhost:1200/telegram/channel/<name>` (or
+`/twitter/user/<name>` if a Twitter route is enabled on your instance).
+
 ## Tests
 
 ```bash
@@ -65,9 +117,7 @@ pytest
 
 ## Extending
 
-- Add more feeds (Telegram/X RSS bridges, exchange blogs, GitHub release
-  feeds, regulatory news) to `RSS_FEEDS`.
-- Swap `RuleBasedClassifier` for an LLM-backed classifier implementing the
-  same `Classifier` protocol in `grambot/processing/classifier.py`.
 - Add on-chain metrics and historical signal backtesting as described in the
   original design notes.
+- Add a message queue (e.g. Redis) if you scale to many more feeds/sources.
+
