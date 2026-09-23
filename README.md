@@ -102,6 +102,14 @@ docker compose --profile rsshub up -d   # + собственный RSSHub для
 | Google News RSS (запрос TON/Toncoin/GRAM/The Open Network) | сотни изданий; каждое считается отдельным источником |
 | Cointelegraph, Decrypt, CryptoSlate, The Block | профильные крипто-СМИ |
 | Telegram-каналы `tonblockchain`, `tonstatus`, `durov`, `telegram` через RSSHub | официальные объявления; считаются подтверждёнными сразу (`TRUSTED_SOURCES`) |
+| GitHub `ton-blockchain/ton` (releases.atom) | обновления сети; попадают в `/recent`, сами по себе сигнал не дают |
+
+**Чего нет по умолчанию:** X/Twitter — публичного RSS у X нет, API платный;
+работает только через свой RSSHub с cookie аккаунта X
+(`/twitter/user/<name>`). Reddit — RSS есть (`https://www.reddit.com/r/TON_Blockchain/new/.rss`),
+но r/toncoin неактивен, а посты в основном рекламные, поэтому добавляйте по
+желанию через `RSS_FEEDS`. Ончейн-метрики (крупные переводы, ликвидации) пока
+не отслеживаются.
 
 Публичный RSSHub (`rsshub.rssforever.com`) может отваливаться — для надёжности
 поднимите свой (`--profile rsshub`). Через RSSHub так же подключаются X/Twitter

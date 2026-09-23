@@ -83,6 +83,9 @@ DEFAULT_RSS_FEEDS = [
     "https://rsshub.rssforever.com/telegram/channel/tonstatus",
     "https://rsshub.rssforever.com/telegram/channel/durov",
     "https://rsshub.rssforever.com/telegram/channel/telegram",
+    # Official node releases (network upgrades). Not trusted for alerts on
+    # their own: changelog wording ("fixed crash") confuses sentiment.
+    "https://github.com/ton-blockchain/ton/releases.atom",
 ]
 
 DEFAULT_KEYWORDS = [
