@@ -18,8 +18,11 @@ def _split_csv(value: str) -> List[str]:
 
 
 DEFAULT_RSS_FEEDS = [
-    "https://blog.ton.org/rss",
-    "https://telegram.org/blog/rss",
+    "https://news.google.com/rss/search?q=TON+OR+Toncoin+OR+GRAM+OR+%22The+Open+Network%22&hl=en-US&gl=US&ceid=US:en",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://cryptoslate.com/feed/",
+    "https://www.theblock.co/rss.xml",
 ]
 
 DEFAULT_KEYWORDS = [
