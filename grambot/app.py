@@ -8,10 +8,19 @@ import threading
 import time
 from typing import List, Optional, Sequence, Tuple
 
+from . import onchain as onchain_module
 from . import price as price_module
 from .commands import MUTED_UNTIL_KEY, CommandHandler
 from .config import Settings
-from .notifier import TelegramNotifier, format_news_alert, format_price_alert, format_startup
+from .notifier import (
+    TelegramNotifier,
+    format_network_alert,
+    format_news_alert,
+    format_price_alert,
+    format_startup,
+    format_whale_alert,
+)
+from .onchain import Labels, MasterchainState, ScanResult, TonCenterClient, Transfer
 from .price import PriceMove
 from .processing.classifier import Classifier, RuleBasedClassifier, meets_min_strength
 from .processing.clustering import find_matching_cluster, new_cluster_id
@@ -25,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 LAST_PRICE_ALERT_KEY = "last_price_alert_at"
 LAST_PRUNE_KEY = "last_prune_at"
+ONCHAIN_LAST_UTIME_KEY = "onchain_last_utime"
+LAST_WHALE_ALERT_KEY = "last_whale_alert_at"
+NETWORK_STALLED_SINCE_KEY = "network_stalled_since"
 
 
 class GramTonMonitor:
@@ -60,6 +72,14 @@ class GramTonMonitor:
             display_currency=settings.display_currency,
         )
         self.fiat_rates = price_module.FiatRates()
+
+        self.onchain_enabled = settings.enable_onchain
+        self.ton_client = TonCenterClient(api_key=settings.toncenter_api_key)
+        self.labels = Labels(url=settings.labels_url or None)
+        self._onchain_lock = threading.Lock()
+        self.last_onchain_poll_at: Optional[float] = None
+        self.last_scan: Optional[ScanResult] = None
+        self.last_masterchain: Optional[MasterchainState] = None
 
     def _localize(self, move: Optional[PriceMove]) -> Optional[PriceMove]:
         if move is None:
@@ -248,6 +268,147 @@ class GramTonMonitor:
             )
         return self.poll_price(alert=False)
 
+    # -- on-chain ------------------------------------------------------------
+    def poll_onchain(self, alert: bool = True) -> Optional[ScanResult]:
+        """Check network health and scan for large transfers since the last run."""
+        if not self.onchain_enabled:
+            return None
+        with self._onchain_lock:
+            self.last_onchain_poll_at = time.time()
+            self.labels.refresh_if_stale()
+            if time.time() < self.ton_client.backoff_until:
+                logger.info("toncenter backoff active for %.0fs; skipping on-chain poll", self.ton_client.backoff_until - time.time())
+                return None
+            self.ton_client.last_error = None
+            self._check_network(alert)
+            since = self.storage.get_float(ONCHAIN_LAST_UTIME_KEY)
+            if since is None:
+                # Start slightly in the past so the first poll produces a real sample.
+                since = time.time() - 60
+            result = onchain_module.scan_transfers(
+                self.ton_client,
+                self.labels,
+                since,
+                min_ton=self.settings.whale_min_ton / 10.0,
+                max_pages=self.settings.onchain_max_pages,
+            )
+            self.last_scan = result
+            if result.gap_seconds:
+                logger.warning("On-chain scan fell behind; skipped %.0f min of history", result.gap_seconds / 60)
+            if result.last_utime > since:
+                self.storage.set_value(ONCHAIN_LAST_UTIME_KEY, str(result.last_utime))
+            new_transfers: List[Transfer] = []
+            for transfer in result.transfers:
+                inserted = self.storage.record_transfer(
+                    transfer.hash,
+                    transfer.utime,
+                    transfer.source,
+                    transfer.destination,
+                    transfer.amount_ton,
+                    transfer.source_label.display() if transfer.source_label else None,
+                    transfer.destination_label.display() if transfer.destination_label else None,
+                    transfer.kind,
+                )
+                if inserted:
+                    new_transfers.append(transfer)
+            logger.info(
+                "On-chain scan: %d page(s), %d message(s), %d transfer(s) ≥ %.0f TON%s",
+                result.pages, result.messages, len(new_transfers), self.settings.whale_min_ton / 10.0,
+                "" if result.complete else " (incomplete)",
+            )
+        if alert:
+            for transfer in new_transfers:
+                if transfer.amount_ton >= self.settings.whale_min_ton and transfer.kind in onchain_module.ALERT_KINDS:
+                    self._maybe_whale_alert(transfer)
+        return result
+
+    def _maybe_whale_alert(self, transfer: Transfer) -> bool:
+        last = self.storage.get_float(LAST_WHALE_ALERT_KEY) or 0.0
+        cooldown = self.settings.onchain_alert_cooldown_minutes * 60
+        # Very large transfers (2× the threshold) bypass the cooldown.
+        if time.time() - last < cooldown and transfer.amount_ton < 2 * self.settings.whale_min_ton:
+            logger.info("Whale transfer %.0f TON within cooldown; not alerting", transfer.amount_ton)
+            return False
+        allowed, why = self.can_notify()
+        if not allowed:
+            logger.info("Whale alert suppressed (%s)", why)
+            return False
+        sentiment, strength = onchain_module.transfer_sentiment(transfer, self.settings.whale_min_ton)
+        move = self._safe(self.current_price_move)
+        if not self.notifier.send(format_whale_alert(transfer, sentiment, strength, move)):
+            return False
+        self.storage.set_value(LAST_WHALE_ALERT_KEY, str(time.time()))
+        self.storage.mark_transfer_notified(transfer.hash)
+        src = transfer.source_label.name if transfer.source_label else "?"
+        dst = transfer.destination_label.name if transfer.destination_label else "?"
+        self.storage.record_signal(
+            kind="onchain",
+            title=f"Перевод {transfer.amount_ton:,.0f} TON: {src} → {dst} ({transfer.kind})".replace(",", " "),
+            url=transfer.url,
+            sentiment=sentiment,
+            strength=strength,
+            source_count=1,
+            price_at_send=move.price_usd if move else None,
+        )
+        logger.info("Whale alert sent: %.0f TON %s", transfer.amount_ton, transfer.kind)
+        return True
+
+    def _check_network(self, alert: bool) -> Optional[MasterchainState]:
+        try:
+            state = self.ton_client.masterchain_state()
+        except onchain_module.RateLimited as exc:
+            self.ton_client.backoff_until = time.time() + min(exc.retry_after, 3600.0)
+            self.ton_client.last_error = str(exc)
+            return None
+        except Exception as exc:  # network / API errors are not a chain stall
+            self.ton_client.last_error = str(exc)
+            logger.warning("toncenter masterchainInfo failed: %s", exc)
+            return None
+        self.last_masterchain = state
+        stalled_since = self.storage.get_float(NETWORK_STALLED_SINCE_KEY)
+        threshold = self.settings.network_stall_minutes * 60
+        if state.age_seconds >= threshold:
+            if stalled_since is None:
+                self.storage.set_value(NETWORK_STALLED_SINCE_KEY, str(state.gen_utime))
+                logger.warning("TON masterchain block #%d is %.0fs old", state.seqno, state.age_seconds)
+                if alert and self.can_notify()[0] and self.notifier.send(format_network_alert(state.age_seconds, state.seqno)):
+                    self.storage.record_signal(
+                        kind="onchain",
+                        title=f"Остановка сети TON: блок #{state.seqno} устарел на {state.age_seconds / 60:.0f} мин",
+                        url="https://tonstat.us",
+                        sentiment="negative",
+                        strength="high",
+                        source_count=1,
+                        price_at_send=None,
+                    )
+        elif stalled_since is not None:
+            self.storage.set_value(NETWORK_STALLED_SINCE_KEY, None)
+            pause = max(0.0, state.gen_utime - stalled_since)
+            logger.info("TON masterchain resumed after %.0fs", pause)
+            if alert and self.notifier.is_configured:
+                self.notifier.send(format_network_alert(pause, state.seqno, recovered=True))
+        return state
+
+    def onchain_status(self) -> dict:
+        """Summary for /status: scan lag, last block age, backoff state."""
+        info = {
+            "enabled": self.onchain_enabled,
+            "labels": len(self.labels),
+            "last_poll_at": self.last_onchain_poll_at,
+            "lag_seconds": None,
+            "block_age_seconds": None,
+            "seqno": None,
+            "error": self.ton_client.last_error,
+            "backoff_seconds": max(0.0, self.ton_client.backoff_until - time.time()),
+        }
+        last_utime = self.storage.get_float(ONCHAIN_LAST_UTIME_KEY)
+        if last_utime:
+            info["lag_seconds"] = max(0.0, time.time() - last_utime)
+        if self.last_masterchain:
+            info["block_age_seconds"] = max(0.0, time.time() - self.last_masterchain.gen_utime)
+            info["seqno"] = self.last_masterchain.seqno
+        return info
+
     def update_signal_followups(self) -> int:
         """Fill in price 1h/24h after each sent signal (for /stats)."""
         now = time.time()
@@ -294,21 +455,23 @@ class GramTonMonitor:
     def run_once(self) -> int:
         self._safe(self.poll_price)
         notified = self._safe(self.poll_news_once) or 0
+        self._safe(self.poll_onchain)
         self._safe(self.update_signal_followups)
         return notified
 
     def run_forever(self) -> None:
         self._install_signal_handlers()
         logger.info(
-            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss",
+            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss, on-chain %s",
             len(self.settings.rss_feeds), self.classifier_name,
             self.settings.poll_interval_seconds, self.settings.price_poll_interval_seconds,
+            f"every {self.settings.onchain_poll_interval_seconds}s" if self.onchain_enabled else "disabled",
         )
         if self.settings.send_startup_message and self.notifier.is_configured:
             self.notifier.send(
                 format_startup(
                     len(self.settings.rss_feeds), self.settings.keywords, self.classifier_name,
-                    self.settings.enable_commands,
+                    self.settings.enable_commands, onchain=self.onchain_enabled,
                 )
             )
         if self.settings.enable_commands and self.notifier.is_configured:
@@ -316,6 +479,7 @@ class GramTonMonitor:
 
         next_news = 0.0
         next_price = 0.0
+        next_onchain = 0.0 if self.onchain_enabled else float("inf")
         try:
             while not self.stop_event.is_set():
                 now = time.time()
@@ -327,9 +491,15 @@ class GramTonMonitor:
                     self._poll_requested = False
                     self._safe(self.poll_news_once)
                     next_news = time.time() + self.settings.poll_interval_seconds
+                if now >= next_onchain:
+                    result = self._safe(self.poll_onchain)
+                    # Hit the page cap without errors: keep catching up quickly.
+                    catching_up = result is not None and not result.complete and result.error is None
+                    delay = 10 if catching_up else self.settings.onchain_poll_interval_seconds
+                    next_onchain = max(time.time() + delay, self.ton_client.backoff_until)
                 self._safe(self.maybe_prune)
 
-                timeout = max(1.0, min(next_news, next_price) - time.time())
+                timeout = max(1.0, min(next_news, next_price, next_onchain) - time.time())
                 self.wake_event.wait(timeout)
                 self.wake_event.clear()
         finally:

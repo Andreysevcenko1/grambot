@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_signals_sent ON signals(sent_at);
 
+CREATE TABLE IF NOT EXISTS onchain_transfers (
+    hash TEXT PRIMARY KEY,
+    utime REAL NOT NULL,
+    source TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    amount_ton REAL NOT NULL,
+    source_label TEXT,
+    destination_label TEXT,
+    kind TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_onchain_utime ON onchain_transfers(utime);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -117,12 +130,42 @@ class SignalRecord:
 class SignalStats:
     total_news: int = 0
     total_price: int = 0
+    total_onchain: int = 0
     evaluated_1h: int = 0
     hits_1h: int = 0
     avg_abs_move_1h: Optional[float] = None
     evaluated_24h: int = 0
     hits_24h: int = 0
     avg_abs_move_24h: Optional[float] = None
+
+
+@dataclass
+class TransferRecord:
+    hash: str
+    utime: float
+    source: str
+    destination: str
+    amount_ton: float
+    source_label: Optional[str]
+    destination_label: Optional[str]
+    kind: str
+    notified: bool
+
+
+@dataclass
+class FlowStats:
+    """Exchange flows over a window, in TON."""
+    deposits_ton: float = 0.0
+    withdrawals_ton: float = 0.0
+    deposits_count: int = 0
+    withdrawals_count: int = 0
+    total_count: int = 0
+    total_ton: float = 0.0
+
+    @property
+    def net_ton(self) -> float:
+        """Positive = more left exchanges than arrived (accumulation)."""
+        return self.withdrawals_ton - self.deposits_ton
 
 
 def _row_to_signal(row: sqlite3.Row) -> SignalRecord:
@@ -414,6 +457,8 @@ class Storage:
         stats = SignalStats()
         row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'price'")
         stats.total_price = int(row["c"]) if row else 0
+        row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'onchain'")
+        stats.total_onchain = int(row["c"]) if row else 0
         rows = self._query(
             "SELECT sentiment, price_at_send, price_after_1h, price_after_24h FROM signals WHERE kind = 'news'"
         )
@@ -440,6 +485,73 @@ class Storage:
 
         stats.evaluated_1h, stats.hits_1h, stats.avg_abs_move_1h = evaluate("price_after_1h")
         stats.evaluated_24h, stats.hits_24h, stats.avg_abs_move_24h = evaluate("price_after_24h")
+        return stats
+
+    # -- on-chain transfers ------------------------------------------------
+    def record_transfer(
+        self,
+        hash: str,
+        utime: float,
+        source: str,
+        destination: str,
+        amount_ton: float,
+        source_label: Optional[str],
+        destination_label: Optional[str],
+        kind: str,
+    ) -> bool:
+        """Insert a transfer; returns False when the hash was already known."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO onchain_transfers
+                    (hash, utime, source, destination, amount_ton, source_label, destination_label, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (hash, utime, source, destination, amount_ton, source_label, destination_label, kind),
+            )
+            return cur.rowcount > 0
+
+    def mark_transfer_notified(self, hash: str) -> None:
+        self._execute("UPDATE onchain_transfers SET notified = 1 WHERE hash = ?", (hash,))
+
+    def recent_transfers(self, since_ts: float, limit: int = 10, min_ton: float = 0.0) -> List[TransferRecord]:
+        rows = self._query(
+            """
+            SELECT * FROM onchain_transfers
+            WHERE utime >= ? AND amount_ton >= ?
+            ORDER BY amount_ton DESC LIMIT ?
+            """,
+            (since_ts, min_ton, limit),
+        )
+        return [
+            TransferRecord(
+                hash=r["hash"],
+                utime=r["utime"],
+                source=r["source"],
+                destination=r["destination"],
+                amount_ton=r["amount_ton"],
+                source_label=r["source_label"],
+                destination_label=r["destination_label"],
+                kind=r["kind"],
+                notified=bool(r["notified"]),
+            )
+            for r in rows
+        ]
+
+    def flow_stats(self, since_ts: float) -> FlowStats:
+        stats = FlowStats()
+        rows = self._query(
+            "SELECT kind, COUNT(*) AS c, COALESCE(SUM(amount_ton), 0) AS total "
+            "FROM onchain_transfers WHERE utime >= ? GROUP BY kind",
+            (since_ts,),
+        )
+        for r in rows:
+            stats.total_count += int(r["c"])
+            stats.total_ton += float(r["total"])
+            if r["kind"] == "exchange_deposit":
+                stats.deposits_count, stats.deposits_ton = int(r["c"]), float(r["total"])
+            elif r["kind"] == "exchange_withdrawal":
+                stats.withdrawals_count, stats.withdrawals_ton = int(r["c"]), float(r["total"])
         return stats
 
     # -- key/value state ---------------------------------------------------
@@ -475,4 +587,5 @@ class Storage:
             deleted += self._conn.execute("DELETE FROM seen_items WHERE published_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM clusters WHERE last_seen_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM price_history WHERE fetched_at < ?", (cutoff,)).rowcount
+            deleted += self._conn.execute("DELETE FROM onchain_transfers WHERE utime < ?", (cutoff,)).rowcount
             return deleted

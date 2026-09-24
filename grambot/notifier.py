@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import requests
 
+from .onchain import KIND_LABELS, Transfer
 from .price import PriceMove
 from .processing.classifier import Classification
 from .sources import NewsItem
@@ -159,15 +160,75 @@ def format_price_alert(move: PriceMove) -> str:
     return truncate("\n".join(lines))
 
 
-def format_startup(feed_count: int, keywords: Sequence[str], classifier_name: str, commands_enabled: bool) -> str:
+def format_startup(feed_count: int, keywords: Sequence[str], classifier_name: str, commands_enabled: bool, onchain: bool = False) -> str:
     lines = [
         "🤖 GRAM/TON монитор запущен",
         f"Лент: {feed_count} · ключевых слов: {len(keywords)}",
         f"Классификатор: {html.escape(classifier_name)}",
     ]
+    if onchain:
+        lines.append("Ончейн: крупные переводы и состояние сети — включено")
     if commands_enabled:
-        lines.append("Команды: /status /price /recent /stats /feeds /help")
+        commands = "/status /price /recent /stats /feeds /help"
+        if onchain:
+            commands = "/status /price /whales /recent /stats /feeds /help"
+        lines.append(f"Команды: {commands}")
     return "\n".join(lines)
+
+
+def fmt_ton(value: float) -> str:
+    if value >= 1e9:
+        return f"{value / 1e9:.2f} млрд TON".replace(".", ",")
+    if value >= 1e6:
+        return f"{value / 1e6:.2f} млн TON".replace(".", ",")
+    if value >= 1e3:
+        return f"{value / 1e3:.0f} тыс. TON"
+    return f"{value:.0f} TON"
+
+
+def _party(label_text: Optional[str], friendly: str) -> str:
+    short = f"{friendly[:6]}…{friendly[-4:]}" if len(friendly) > 12 else friendly
+    link = f'<a href="https://tonviewer.com/{html.escape(friendly, quote=True)}">{html.escape(short)}</a>'
+    if label_text:
+        return f"<b>{html.escape(label_text)}</b> ({link})"
+    return f"неизвестный кошелёк ({link})"
+
+
+def format_whale_alert(transfer: Transfer, sentiment: str, strength: str, move: Optional[PriceMove] = None) -> str:
+    header_emoji = {"negative": "🔴", "positive": "🟢"}.get(sentiment, "⚪")
+    amount = fmt_ton(transfer.amount_ton)
+    if move is not None:
+        amount += f" (≈ {fmt_usd(transfer.amount_ton * move.price_usd)})"
+    lines = [
+        f"🐋 {header_emoji} Крупный перевод: <b>{amount}</b>",
+        "",
+        f"Откуда: {_party(transfer.source_label.display() if transfer.source_label else None, transfer.source_friendly)}",
+        f"Куда: {_party(transfer.destination_label.display() if transfer.destination_label else None, transfer.destination_friendly)}",
+        f"Тип: {KIND_LABELS.get(transfer.kind, transfer.kind)}",
+        f"Сила: {STRENGTH_LABELS.get(strength, strength)}",
+    ]
+    price_lines = format_price_context(move)
+    if price_lines:
+        lines.append("")
+        lines.extend(price_lines)
+    lines.extend(["", f'🔗 <a href="{html.escape(transfer.url, quote=True)}">Транзакция</a> · {fmt_time(transfer.utime)}', DISCLAIMER])
+    return truncate("\n".join(lines))
+
+
+def format_network_alert(age_seconds: float, seqno: int, recovered: bool = False) -> str:
+    minutes = age_seconds / 60.0
+    if recovered:
+        return "\n".join([
+            "🟢 Сеть TON снова производит блоки",
+            f"Пауза длилась ≈ {minutes:.0f} мин · последний блок #{seqno}",
+            DISCLAIMER,
+        ])
+    return "\n".join([
+        "🔴 Возможная остановка сети TON",
+        f"Последний блок мастерчейна #{seqno} был {minutes:.0f} мин назад.",
+        "Обычно блоки идут каждые ~5 секунд; проверьте официальные каналы @tonstatus и биржи (возможны задержки ввода/вывода).",
+        DISCLAIMER,
+    ])
 
 
 class TelegramNotifier:

@@ -18,9 +18,12 @@ from .notifier import (
     TelegramNotifier,
     fmt_pct,
     fmt_time,
+    fmt_ton,
+    fmt_usd,
     format_news_alert,
     format_price_context,
 )
+from .onchain import KIND_LABELS
 from .processing.classifier import Classification
 from .sources import NewsItem
 
@@ -35,6 +38,7 @@ MUTED_UNTIL_KEY = "muted_until"
 COMMANDS = [
     ("status", "Состояние бота"),
     ("price", "Цена TON и движение"),
+    ("whales", "Крупные ончейн-переводы за 24ч"),
     ("recent", "Последние релевантные новости"),
     ("stats", "Статистика сигналов"),
     ("feeds", "Состояние источников"),
@@ -53,6 +57,7 @@ HELP_TEXT = "\n".join(
         "",
         "/status — состояние бота",
         "/price — цена TON, изменение и объём",
+        "/whales [N] — крупные переводы и потоки бирж за 24ч",
         "/recent [N] — последние релевантные новости",
         "/stats — как сигналы соотносились с ценой",
         "/feeds — какие источники работают",
@@ -153,6 +158,7 @@ class CommandHandler(threading.Thread):
             "/help": self.cmd_help,
             "/status": self.cmd_status,
             "/price": self.cmd_price,
+            "/whales": self.cmd_whales,
             "/recent": self.cmd_recent,
             "/stats": self.cmd_stats,
             "/feeds": self.cmd_feeds,
@@ -184,6 +190,7 @@ class CommandHandler(threading.Thread):
         lines.append(f"Сигналов за 24ч: {self.storage.count_signals_since(day_ago)}")
         lines.append(f"Классификатор: {html.escape(m.classifier_name)}")
         lines.append(f"Интервал: новости {self.settings.poll_interval_seconds // 60} мин, цена {self.settings.price_poll_interval_seconds // 60} мин")
+        lines.append(self._onchain_status_line())
         muted_until = m.muted_until()
         if muted_until:
             lines.append(f"🔇 Уведомления на паузе до {fmt_time(muted_until)}")
@@ -200,6 +207,67 @@ class CommandHandler(threading.Thread):
         lines = ["💰 <b>TON / GRAM</b>"] + format_price_context(move)
         provider = self.monitor.price_client.last_provider or move.provider
         lines.append(f"<i>Источник: {html.escape(provider)} · {fmt_time(time.time())}</i>")
+        return "\n".join(lines)
+
+    def _onchain_status_line(self) -> str:
+        info = self.monitor.onchain_status()
+        if not info["enabled"]:
+            return "Ончейн: выключен"
+        if info["backoff_seconds"] > 0:
+            return f"Ончейн: лимит TON Center, пауза {info['backoff_seconds'] / 60:.0f} мин"
+        if info["error"]:
+            return f"Ончейн: ошибка — {html.escape(str(info['error'])[:60])}"
+        if info["last_poll_at"] is None:
+            return f"Ончейн: ожидает первого опроса · меток адресов: {info['labels']}"
+        parts = [f"Ончейн: отставание {_fmt_duration(info['lag_seconds'] or 0)}"]
+        if info["block_age_seconds"] is not None:
+            parts.append(f"последний блок #{info['seqno']} {info['block_age_seconds']:.0f}с назад")
+        parts.append(f"меток адресов: {info['labels']}")
+        return " · ".join(parts)
+
+    def cmd_whales(self, args: List[str]) -> str:
+        if not self.monitor.onchain_enabled:
+            return "Ончейн-мониторинг выключен (ENABLE_ONCHAIN=false)."
+        limit = 5
+        if args and args[0].isdigit():
+            limit = max(1, min(15, int(args[0])))
+        day_ago = time.time() - 86400
+        flows = self.storage.flow_stats(day_ago)
+        transfers = self.storage.recent_transfers(day_ago, limit=limit)
+        move = self.monitor.current_price_move()
+        price = move.price_usd if move else None
+
+        def usd(amount_ton: float) -> str:
+            return f" (≈ {fmt_usd(amount_ton * price)})" if price else ""
+
+        threshold = self.settings.whale_min_ton / 10.0
+        lines = [
+            "🐋 <b>Ончейн за 24ч</b>",
+            f"Переводов ≥ {fmt_ton(threshold)}: {flows.total_count} на {fmt_ton(flows.total_ton)}{usd(flows.total_ton)}",
+            f"На биржи: {fmt_ton(flows.deposits_ton)} ({flows.deposits_count}) · с бирж: {fmt_ton(flows.withdrawals_ton)} ({flows.withdrawals_count})",
+        ]
+        if flows.deposits_count or flows.withdrawals_count:
+            net = flows.net_ton
+            verdict = "отток с бирж (чаще накопление)" if net > 0 else "приток на биржи (возможное давление продаж)" if net < 0 else "баланс"
+            lines.append(f"Нетто: {'+' if net > 0 else ''}{fmt_ton(abs(net)) if net else '0 TON'} — {verdict}")
+        if transfers:
+            lines.append("")
+            lines.append(f"Крупнейшие {len(transfers)}:")
+            for t in transfers:
+                src = html.escape(t.source_label or "неизвестный")
+                dst = html.escape(t.destination_label or "неизвестный")
+                mark = " 🔔" if t.notified else ""
+                lines.append(
+                    f'• <a href="https://tonviewer.com/transaction/{html.escape(t.hash, quote=True)}">{fmt_ton(t.amount_ton)}</a>'
+                    f" {src} → {dst}\n  <i>{KIND_LABELS.get(t.kind, t.kind)} · {fmt_time(t.utime)}</i>{mark}"
+                )
+        else:
+            lines.append("")
+            lines.append("Крупных переводов за сутки пока не зафиксировано.")
+        info = self.monitor.onchain_status()
+        if info["lag_seconds"] is not None:
+            lines.append(f"<i>Данные TON Center, отставание {_fmt_duration(info['lag_seconds'])}; метки адресов: ton-labels.</i>")
+        lines.append(DISCLAIMER)
         return "\n".join(lines)
 
     def cmd_recent(self, args: List[str]) -> str:
@@ -219,7 +287,12 @@ class CommandHandler(threading.Thread):
 
     def cmd_stats(self, args: List[str]) -> str:
         s = self.storage.signal_stats()
-        lines = ["📈 <b>Статистика сигналов</b>", f"Новостных сигналов: {s.total_news}", f"Ценовых алертов: {s.total_price}"]
+        lines = [
+            "📈 <b>Статистика сигналов</b>",
+            f"Новостных сигналов: {s.total_news}",
+            f"Ценовых алертов: {s.total_price}",
+            f"Ончейн-сигналов: {s.total_onchain}",
+        ]
 
         def block(label: str, evaluated: int, hits: int, avg: Optional[float]) -> str:
             if not evaluated:

@@ -81,3 +81,30 @@ def test_price_command_shows_local_currency_and_provider(monitor):
     text = handler.handle_command("/price")
     assert "$2,000 (≈ 1,800 €)" in text
     assert "Источник:" in text
+
+
+def test_whales_command_empty_and_with_data(monitor):
+    handler = handler_for(monitor)
+    text = handler.handle_command("/whales")
+    assert "Ончейн за 24ч" in text and "не зафиксировано" in text
+    assert "Ончейн: ожидает первого опроса" in handler.handle_command("/status")
+
+    now = time.time()
+    monitor.storage.record_transfer("h1", now - 60, "0:A", "0:B", 600_000, None, "Binance (hot wallet)", "exchange_deposit")
+    monitor.storage.record_transfer("h2", now - 30, "0:C", "0:D", 200_000, "OKX", None, "exchange_withdrawal")
+    monitor.storage.record_transfer("h3", now - 30, "0:E", "0:F", 70_000, None, None, "unknown")
+    monitor.storage.mark_transfer_notified("h1")
+    monitor.storage.set_value("onchain_last_utime", str(now - 20))
+    monitor.last_onchain_poll_at = now
+    text = handler.handle_command("/whales 2")
+    assert "Переводов ≥ 50 тыс. TON: 3" in text
+    assert "На биржи: 600 тыс. TON (1)" in text and "с бирж: 200 тыс. TON (1)" in text
+    assert "приток на биржи" in text
+    assert "Крупнейшие 2" in text and "h1" in text and "h3" not in text
+    assert "Binance (hot wallet)" in text and "🔔" in text
+    assert "отставание" in text
+    assert "Ончейн: отставание" in handler.handle_command("/status")
+
+    monitor.onchain_enabled = False
+    assert "выключен" in handler.handle_command("/whales")
+    assert "Ончейн: выключен" in handler.handle_command("/status")
