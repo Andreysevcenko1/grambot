@@ -5,3 +5,7 @@ __pycache__/
 *.log
 .env
 .pytest_cache/
+*.heartbeat
+*.heartbeat.tmp
+*.db-wal
+*.db-shm

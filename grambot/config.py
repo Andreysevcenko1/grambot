@@ -142,9 +142,18 @@ class Settings:
     onchain_alert_cooldown_minutes: int = 10
     network_stall_minutes: int = 5
     labels_url: str = "https://raw.githubusercontent.com/shuva10v/ton-labels/build/assets.json"
+    max_memory_mb: float = 512.0
+    watchdog_timeout_minutes: int = 20
+    health_alert_minutes: int = 60
+    heartbeat_path: str = ""
+    log_file: str = ""
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
+
+    @property
+    def heartbeat_file(self) -> str:
+        return self.heartbeat_path or f"{self.database_path}.heartbeat"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -180,6 +189,11 @@ class Settings:
             onchain_alert_cooldown_minutes=max(0, _env_int("ONCHAIN_ALERT_COOLDOWN_MINUTES", 10)),
             network_stall_minutes=max(1, _env_int("NETWORK_STALL_MINUTES", 5)),
             labels_url=os.getenv("LABELS_URL", cls.labels_url).strip(),
+            max_memory_mb=max(0.0, _env_float("MAX_MEMORY_MB", 512.0)),
+            watchdog_timeout_minutes=max(0, _env_int("WATCHDOG_TIMEOUT_MINUTES", 20)),
+            health_alert_minutes=max(1, _env_int("HEALTH_ALERT_MINUTES", 60)),
+            heartbeat_path=os.getenv("HEARTBEAT_PATH", "").strip(),
+            log_file=os.getenv("LOG_FILE", "").strip(),
             openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",

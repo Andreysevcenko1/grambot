@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_LENGTH = 4096
+MAX_FLOOD_WAIT_SECONDS = 30.0
 _TAG_RE = re.compile(r"<[^>]+>")
 
 SENTIMENT_HEADERS = {
@@ -160,9 +161,20 @@ def format_price_alert(move: PriceMove) -> str:
     return truncate("\n".join(lines))
 
 
-def format_startup(feed_count: int, keywords: Sequence[str], classifier_name: str, commands_enabled: bool, onchain: bool = False) -> str:
+def format_startup(
+    feed_count: int,
+    keywords: Sequence[str],
+    classifier_name: str,
+    commands_enabled: bool,
+    onchain: bool = False,
+    restart_count: int = 0,
+    last_exit_code: Optional[int] = None,
+) -> str:
+    title = "🤖 GRAM/TON монитор запущен"
+    if restart_count:
+        title = f"♻️ GRAM/TON монитор перезапущен (№{restart_count}, код выхода {last_exit_code})"
     lines = [
-        "🤖 GRAM/TON монитор запущен",
+        title,
         f"Лент: {feed_count} · ключевых слов: {len(keywords)}",
         f"Классификатор: {html.escape(classifier_name)}",
     ]
@@ -239,6 +251,8 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.timeout = timeout
         self._session = requests.Session()
+        self.last_error: Optional[str] = None
+        self.last_error_code: Optional[int] = None
 
     @property
     def is_configured(self) -> bool:
@@ -248,16 +262,29 @@ class TelegramNotifier:
         if not self.token:
             return None
         url = TELEGRAM_API.format(token=self.token, method=method)
-        try:
-            response = self._session.post(url, json=params, timeout=request_timeout or self.timeout)
-            payload = response.json()
-        except (requests.RequestException, ValueError) as exc:
-            logger.warning("Telegram %s failed: %s", method, exc)
+        self.last_error = None
+        self.last_error_code = None
+        for attempt in range(2):
+            try:
+                response = self._session.post(url, json=params, timeout=request_timeout or self.timeout)
+                payload = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                self.last_error = str(exc)
+                logger.warning("Telegram %s failed: %s", method, exc)
+                return None
+            if payload.get("ok"):
+                return payload
+            self.last_error = payload.get("description")
+            self.last_error_code = payload.get("error_code")
+            retry_after = (payload.get("parameters") or {}).get("retry_after")
+            if self.last_error_code == 429 and attempt == 0 and retry_after is not None:
+                wait = min(float(retry_after), MAX_FLOOD_WAIT_SECONDS)
+                logger.info("Telegram flood control on %s; waiting %.0fs", method, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("Telegram %s error: %s", method, self.last_error)
             return None
-        if not payload.get("ok"):
-            logger.warning("Telegram %s error: %s", method, payload.get("description"))
-            return None
-        return payload
+        return None
 
     def send_to(self, chat_id: str, text: str, disable_preview: bool = True) -> bool:
         text = truncate(text)
@@ -271,10 +298,17 @@ class TelegramNotifier:
             parse_mode="HTML",
             disable_web_page_preview=disable_preview,
         )
-        if payload is None:
-            # Retry once as plain text in case the HTML markup was rejected.
+        if payload is None and self.last_error_code == 400 and "parse" in (self.last_error or "").lower():
+            # Telegram rejected the HTML markup: resend as plain text.
             payload = self._call("sendMessage", chat_id=chat_id, text=html.unescape(_TAG_RE.sub("", text)))
         return payload is not None
+
+    def get_me(self) -> Optional[str]:
+        """Bot username, or None when the token is rejected / API unreachable."""
+        payload = self._call("getMe")
+        if payload is None:
+            return None
+        return (payload.get("result") or {}).get("username")
 
     def send(self, text: str, disable_preview: bool = True) -> bool:
         return self.send_to(self.chat_id, text, disable_preview=disable_preview)

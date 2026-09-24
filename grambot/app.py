@@ -1,9 +1,11 @@
 """Application wiring and the main monitoring loop."""
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from typing import List, Optional, Sequence, Tuple
@@ -12,6 +14,7 @@ from . import onchain as onchain_module
 from . import price as price_module
 from .commands import MUTED_UNTIL_KEY, CommandHandler
 from .config import Settings
+from .health import HealthEvent, HealthTracker, Watchdog, format_health_event, heartbeat_age, write_heartbeat
 from .notifier import (
     TelegramNotifier,
     format_network_alert,
@@ -29,6 +32,7 @@ from .processing.llm_classifier import LLMClassifier
 from .sources import NewsItem
 from .sources.rss import FeedResult, RSSSource
 from .storage import Storage
+from .supervisor import Supervisor, is_child_process, restart_info
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,9 @@ LAST_PRUNE_KEY = "last_prune_at"
 ONCHAIN_LAST_UTIME_KEY = "onchain_last_utime"
 LAST_WHALE_ALERT_KEY = "last_whale_alert_at"
 NETWORK_STALLED_SINCE_KEY = "network_stalled_since"
+ONCHAIN_STUCK_FAILURES = 5
+ONCHAIN_STUCK_SKIP_SECONDS = 60
+COMMAND_HANDLER_RESTART_DELAY = 30.0
 
 
 class GramTonMonitor:
@@ -80,6 +87,14 @@ class GramTonMonitor:
         self.last_onchain_poll_at: Optional[float] = None
         self.last_scan: Optional[ScanResult] = None
         self.last_masterchain: Optional[MasterchainState] = None
+        self._onchain_failures = 0
+
+        self.health = HealthTracker(alert_after_seconds=settings.health_alert_minutes * 60)
+        self.heartbeat_at = time.monotonic()
+        self.exit_code = 0
+        self.exit_reason: Optional[str] = None
+        self.command_handler: Optional[CommandHandler] = None
+        self.restart_count, self.last_exit_code = restart_info()
 
     def _localize(self, move: Optional[PriceMove]) -> Optional[PriceMove]:
         if move is None:
@@ -94,6 +109,27 @@ class GramTonMonitor:
     def stop(self) -> None:
         self.stop_event.set()
         self.wake_event.set()
+
+    def request_restart(self, code: int, reason: str) -> None:
+        """Stop with a non-zero code so the supervisor starts a fresh process."""
+        self.exit_code = code
+        self.exit_reason = reason
+        self.stop()
+
+    def beat(self) -> None:
+        self.heartbeat_at = time.monotonic()
+        write_heartbeat(self.settings.heartbeat_file)
+
+    def _report_health(self, component: str, ok: bool, detail: Optional[str] = None) -> None:
+        event = self.health.report(component, ok, detail)
+        if event is not None:
+            self._notify_health(event)
+
+    def _notify_health(self, event: HealthEvent) -> None:
+        text = format_health_event(event)
+        logger.warning("Health: %s", text.replace("\n", " "))
+        if self.notifier.is_configured and not self.muted_until():
+            self.notifier.send(text)
 
     def muted_until(self) -> Optional[float]:
         until = self.storage.get_float(MUTED_UNTIL_KEY)
@@ -143,7 +179,10 @@ class GramTonMonitor:
                 "Poll done: feeds %d/%d ok, %d items, %d fresh, %d relevant, %d new, %d notified",
                 ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified,
             )
-            return notified
+        if results:
+            first_error = next((r.error for r in results if not r.ok and r.error), None)
+            self._report_health("feeds", ok_feeds > 0, first_error)
+        return notified
 
     def _process_item(self, item: NewsItem) -> bool:
         """Cluster, verify, classify and (maybe) notify. Returns True if sent."""
@@ -217,7 +256,9 @@ class GramTonMonitor:
             snapshot = self.price_client.fetch()
             if snapshot is None:
                 logger.warning("All price providers failed (%s)", self.price_client.last_error)
+                self._report_health("price", False, self.price_client.last_error)
                 return None
+            self._report_health("price", True)
             move = price_module.compute_move(self.storage, snapshot, self.settings.price_window_minutes)
             self.storage.add_price_point(
                 snapshot.price_usd,
@@ -297,6 +338,7 @@ class GramTonMonitor:
                 logger.warning("On-chain scan fell behind; skipped %.0f min of history", result.gap_seconds / 60)
             if result.last_utime > since:
                 self.storage.set_value(ONCHAIN_LAST_UTIME_KEY, str(result.last_utime))
+            self._track_onchain_progress(result, since)
             new_transfers: List[Transfer] = []
             for transfer in result.transfers:
                 inserted = self.storage.record_transfer(
@@ -321,6 +363,25 @@ class GramTonMonitor:
                 if transfer.amount_ton >= self.settings.whale_min_ton and transfer.kind in onchain_module.ALERT_KINDS:
                     self._maybe_whale_alert(transfer)
         return result
+
+    def _track_onchain_progress(self, result: ScanResult, since: float) -> None:
+        """Skip a stuck window after repeated non-rate-limit failures; report health."""
+        if result.error is None:
+            self._onchain_failures = 0
+            self._report_health("onchain", True)
+            return
+        if result.rate_limited:
+            return  # expected on the free tier; backoff handles it
+        self._report_health("onchain", False, result.error)
+        if result.last_utime > since:
+            self._onchain_failures = 0
+            return
+        self._onchain_failures += 1
+        if self._onchain_failures >= ONCHAIN_STUCK_FAILURES:
+            skip_to = since + ONCHAIN_STUCK_SKIP_SECONDS
+            self.storage.set_value(ONCHAIN_LAST_UTIME_KEY, str(skip_to))
+            self._onchain_failures = 0
+            logger.warning("On-chain scan stuck at %.0f after %d failures; skipping %ds", since, ONCHAIN_STUCK_FAILURES, ONCHAIN_STUCK_SKIP_SECONDS)
 
     def _maybe_whale_alert(self, transfer: Transfer) -> bool:
         last = self.storage.get_float(LAST_WHALE_ALERT_KEY) or 0.0
@@ -459,7 +520,49 @@ class GramTonMonitor:
         self._safe(self.update_signal_followups)
         return notified
 
-    def run_forever(self) -> None:
+    def _ensure_command_handler(self) -> None:
+        if not (self.settings.enable_commands and self.notifier.is_configured):
+            return
+        handler = self.command_handler
+        if handler is not None and handler.is_alive():
+            return
+        if handler is not None:
+            logger.error("Command handler thread died; starting a new one")
+        self.command_handler = CommandHandler(self, self.notifier)
+        self.command_handler.start()
+
+    def _start_watchdog(self) -> Optional[Watchdog]:
+        hang_timeout = self.settings.watchdog_timeout_minutes * 60
+        if not hang_timeout and not self.settings.max_memory_mb:
+            return None
+        watchdog = Watchdog(
+            heartbeat=lambda: self.heartbeat_at,
+            stop=self.request_restart,
+            hang_timeout=hang_timeout,
+            max_memory_mb=self.settings.max_memory_mb,
+        )
+        watchdog.start()
+        return watchdog
+
+    def _announce_start(self) -> None:
+        if not self.notifier.is_configured:
+            return
+        username = self.notifier.get_me()
+        if username:
+            logger.info("Telegram bot @%s ready", username)
+        elif self.notifier.last_error_code in (401, 404):
+            logger.error("Telegram rejected the bot token (%s); check TELEGRAM_BOT_TOKEN", self.notifier.last_error)
+        # After a few rapid restarts stay quiet: the supervisor keeps trying.
+        if self.settings.send_startup_message and self.restart_count < 3:
+            self.notifier.send(
+                format_startup(
+                    len(self.settings.rss_feeds), self.settings.keywords, self.classifier_name,
+                    self.settings.enable_commands, onchain=self.onchain_enabled,
+                    restart_count=self.restart_count, last_exit_code=self.last_exit_code,
+                )
+            )
+
+    def run_forever(self) -> int:
         self._install_signal_handlers()
         logger.info(
             "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss, on-chain %s",
@@ -467,45 +570,54 @@ class GramTonMonitor:
             self.settings.poll_interval_seconds, self.settings.price_poll_interval_seconds,
             f"every {self.settings.onchain_poll_interval_seconds}s" if self.onchain_enabled else "disabled",
         )
-        if self.settings.send_startup_message and self.notifier.is_configured:
-            self.notifier.send(
-                format_startup(
-                    len(self.settings.rss_feeds), self.settings.keywords, self.classifier_name,
-                    self.settings.enable_commands, onchain=self.onchain_enabled,
-                )
-            )
-        if self.settings.enable_commands and self.notifier.is_configured:
-            CommandHandler(self, self.notifier).start()
+        if self.restart_count:
+            logger.warning("Restarted by supervisor (%d in a row, last exit code %s)", self.restart_count, self.last_exit_code)
+        self.beat()
+        watchdog = self._start_watchdog()
+        self._safe(self._announce_start)
 
-        next_news = 0.0
-        next_price = 0.0
-        next_onchain = 0.0 if self.onchain_enabled else float("inf")
+        now = time.monotonic()
+        next_news = now
+        next_price = now
+        next_onchain = now if self.onchain_enabled else float("inf")
+        next_handler_check = now
         try:
             while not self.stop_event.is_set():
-                now = time.time()
+                now = time.monotonic()
+                if now >= next_handler_check:
+                    self._safe(self._ensure_command_handler)
+                    next_handler_check = now + COMMAND_HANDLER_RESTART_DELAY
                 if now >= next_price:
                     self._safe(self.poll_price)
                     self._safe(self.update_signal_followups)
-                    next_price = time.time() + self.settings.price_poll_interval_seconds
+                    next_price = time.monotonic() + self.settings.price_poll_interval_seconds
                 if now >= next_news or self._poll_requested:
                     self._poll_requested = False
                     self._safe(self.poll_news_once)
-                    next_news = time.time() + self.settings.poll_interval_seconds
+                    next_news = time.monotonic() + self.settings.poll_interval_seconds
                 if now >= next_onchain:
                     result = self._safe(self.poll_onchain)
                     # Hit the page cap without errors: keep catching up quickly.
                     catching_up = result is not None and not result.complete and result.error is None
                     delay = 10 if catching_up else self.settings.onchain_poll_interval_seconds
-                    next_onchain = max(time.time() + delay, self.ton_client.backoff_until)
+                    backoff_left = max(0.0, self.ton_client.backoff_until - time.time())
+                    next_onchain = time.monotonic() + max(delay, backoff_left)
                 self._safe(self.maybe_prune)
+                self.beat()
 
-                timeout = max(1.0, min(next_news, next_price, next_onchain) - time.time())
+                timeout = max(1.0, min(next_news, next_price, next_onchain, next_handler_check) - time.monotonic())
                 self.wake_event.wait(timeout)
                 self.wake_event.clear()
         finally:
-            logger.info("Monitor stopped")
+            if watchdog is not None:
+                watchdog.cancel()
+            if self.exit_code:
+                logger.error("Monitor stopping for restart: %s (exit %d)", self.exit_reason, self.exit_code)
+            else:
+                logger.info("Monitor stopped")
             self.storage.close()
             self.notifier.close()
+        return self.exit_code
 
 
 def build_classifier(settings: Settings) -> Classifier:
@@ -540,25 +652,74 @@ def build_monitor(settings: Optional[Settings] = None, telegram: bool = True) ->
     return GramTonMonitor(settings, storage, source, classifier, notifier, classifier_name=classifier_label(settings))
 
 
-def configure_logging() -> None:
+def configure_logging(log_file: str = "") -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+
+        handlers.append(RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"))
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def install_crash_hooks() -> None:
+    """Log fatal errors instead of dying silently (segfaults, thread crashes)."""
+    try:
+        faulthandler.enable()
+    except (RuntimeError, AttributeError):  # pragma: no cover - no stderr
+        pass
+
+    def thread_hook(args):  # pragma: no cover - only on unexpected thread death
+        logging.getLogger("grambot").critical(
+            "Thread %s crashed", getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = thread_hook
+
+
+def healthcheck(settings: Settings, max_age_seconds: float) -> int:
+    age = heartbeat_age(settings.heartbeat_file)
+    if age is None:
+        print(f"no heartbeat at {settings.heartbeat_file}")
+        return 1
+    if age > max_age_seconds:
+        print(f"heartbeat is {age:.0f}s old (limit {max_age_seconds:.0f}s)")
+        return 1
+    print(f"ok, heartbeat {age:.0f}s ago")
+    return 0
 
 
 def run(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="GRAM/TON news monitor bot")
-    parser.add_argument("--once", action="store_true", help="poll price and news once, then exit")
+    parser.add_argument("--once", action="store_true", help="poll price, news and chain once, then exit")
     parser.add_argument("--no-telegram", action="store_true", help="never send to Telegram (log messages instead)")
+    parser.add_argument("--no-supervise", action="store_true", help="run the bot in this process without the auto-restart supervisor")
+    parser.add_argument("--healthcheck", action="store_true", help="exit 0 if the running bot's heartbeat is fresh (for Docker HEALTHCHECK)")
     args = parser.parse_args(argv)
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
 
-    configure_logging()
-    monitor = build_monitor(telegram=not args.no_telegram)
+    if args.healthcheck:
+        settings = Settings.from_env()
+        max_age = max(15 * 60, settings.watchdog_timeout_minutes * 60 // 2 or 0)
+        return healthcheck(settings, max_age)
+
+    if not args.once and not args.no_supervise and not is_child_process():
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        return Supervisor(argv_list).run()
+
+    settings = Settings.from_env()
+    configure_logging(settings.log_file)
+    install_crash_hooks()
+    monitor = build_monitor(settings, telegram=not args.no_telegram)
     if args.once:
         try:
             notified = monitor.run_once()
@@ -567,5 +728,4 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             monitor.notifier.close()
         logger.info("Single run finished, %d notification(s)", notified)
         return 0
-    monitor.run_forever()
-    return 0
+    return monitor.run_forever()

@@ -24,10 +24,15 @@ class FakeNotifier:
         self.fail = fail
         self.chat_id = "1"
         self.token = "t" if configured else ""
+        self.last_error = None
+        self.last_error_code = None
 
     @property
     def is_configured(self):
         return self.configured
+
+    def get_me(self):
+        return "testbot" if self.configured else None
 
     def send(self, text, disable_preview=True):
         if self.fail:

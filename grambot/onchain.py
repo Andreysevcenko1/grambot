@@ -113,6 +113,7 @@ class ScanResult:
     complete: bool = True
     gap_seconds: float = 0.0
     error: Optional[str] = None
+    rate_limited: bool = False
 
 
 @dataclass
@@ -327,6 +328,7 @@ def message_to_transfer(message: dict, labels: Labels, address_book: Dict[str, d
         return None
     try:
         value = int(message.get("value") or 0)
+        created = float(message.get("created_at") or 0)
     except (TypeError, ValueError):
         return None
     if value < min_nano:
@@ -344,7 +346,7 @@ def message_to_transfer(message: dict, labels: Labels, address_book: Dict[str, d
 
     return Transfer(
         hash=message.get("hash") or "",
-        utime=float(message.get("created_at") or 0),
+        utime=created,
         amount_ton=value / NANO,
         source=source,
         destination=destination,
@@ -392,6 +394,7 @@ def scan_transfers(
             client.backoff_until = time.time() + min(exc.retry_after, 3600.0)
             client.last_error = str(exc)
             result.error = str(exc)
+            result.rate_limited = True
             result.complete = False
             logger.info("toncenter rate limited; backing off %.0fs", exc.retry_after)
             return result
@@ -404,7 +407,10 @@ def scan_transfers(
         result.pages += 1
         result.messages += len(rows)
         for message in rows:
-            created = float(message.get("created_at") or 0)
+            try:
+                created = float(message.get("created_at") or 0)
+            except (TypeError, ValueError):
+                created = 0.0
             if created > result.last_utime:
                 result.last_utime = created
             transfer = message_to_transfer(message, labels, address_book, min_nano)

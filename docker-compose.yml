@@ -6,8 +6,14 @@ services:
     env_file: .env
     environment:
       DATABASE_PATH: /data/grambot.db
+      HEARTBEAT_PATH: /data/grambot.heartbeat
+      TZ: ${TZ:-Europe/Moscow}
     volumes:
       - grambot-data:/data
+    # Hard ceiling; the bot's own watchdog restarts it at MAX_MEMORY_MB (512 by
+    # default) well before the kernel would OOM-kill the container.
+    mem_limit: 768m
+    stop_grace_period: 45s
     logging:
       driver: json-file
       options:

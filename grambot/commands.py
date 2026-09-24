@@ -23,6 +23,7 @@ from .notifier import (
     format_news_alert,
     format_price_context,
 )
+from .health import COMPONENT_TITLES, current_rss_mb
 from .onchain import KIND_LABELS
 from .processing.classifier import Classification
 from .sources import NewsItem
@@ -113,24 +114,36 @@ class CommandHandler(threading.Thread):
             logger.info("Telegram not configured; command handler idle")
             return
         self.notifier.set_commands(COMMANDS)
-        offset = self._initial_offset()
+        offset: Optional[int] = None
+        try:
+            offset = self._initial_offset()
+        except Exception:  # pragma: no cover - storage hiccup; start from "now"
+            logger.exception("Could not read the saved update offset")
         logger.info("Command handler started (offset=%s)", offset)
         while not self.stop_event.is_set():
-            updates = self.notifier.get_updates(offset, timeout_seconds=20)
-            if updates is None:
-                # Network error or another bot instance polling (409): back off.
-                self.stop_event.wait(10)
-                continue
-            if not updates:
-                self.stop_event.wait(1)
-                continue
-            for update in updates:
-                offset = update["update_id"] + 1
-                try:
-                    self.handle_update(update)
-                except Exception:  # pragma: no cover - never let one command kill the loop
-                    logger.exception("Failed to handle update %s", update.get("update_id"))
-            self.storage.set_value(OFFSET_KEY, str(offset))
+            try:
+                offset = self._poll_once(offset)
+            except Exception:  # pragma: no cover - never let anything kill the thread
+                logger.exception("Command handler iteration failed")
+                self.stop_event.wait(5)
+
+    def _poll_once(self, offset: Optional[int]) -> Optional[int]:
+        updates = self.notifier.get_updates(offset, timeout_seconds=20)
+        if updates is None:
+            # Network error or another bot instance polling (409): back off.
+            self.stop_event.wait(10)
+            return offset
+        if not updates:
+            self.stop_event.wait(1)
+            return offset
+        for update in updates:
+            offset = update["update_id"] + 1
+            try:
+                self.handle_update(update)
+            except Exception:  # pragma: no cover - never let one command kill the loop
+                logger.exception("Failed to handle update %s", update.get("update_id"))
+        self.storage.set_value(OFFSET_KEY, str(offset))
+        return offset
 
     # -- dispatch -------------------------------------------------------
     def handle_update(self, update: Dict[str, Any]) -> None:
@@ -191,10 +204,27 @@ class CommandHandler(threading.Thread):
         lines.append(f"Классификатор: {html.escape(m.classifier_name)}")
         lines.append(f"Интервал: новости {self.settings.poll_interval_seconds // 60} мин, цена {self.settings.price_poll_interval_seconds // 60} мин")
         lines.append(self._onchain_status_line())
+        lines.append(self._health_status_line())
         muted_until = m.muted_until()
         if muted_until:
             lines.append(f"🔇 Уведомления на паузе до {fmt_time(muted_until)}")
         return "\n".join(lines)
+
+    def _health_status_line(self) -> str:
+        m = self.monitor
+        parts = []
+        rss = current_rss_mb()
+        if rss is not None:
+            limit = f"/{self.settings.max_memory_mb:.0f}" if self.settings.max_memory_mb else ""
+            parts.append(f"память {rss:.0f}{limit} МБ")
+        parts.append(f"база {self.storage.size_bytes() / (1024 * 1024):.1f} МБ")
+        if m.restart_count:
+            parts.append(f"перезапусков подряд: {m.restart_count}")
+        failing = [f"{COMPONENT_TITLES.get(c, c)}: {status}" for c, status in m.health.summary() if status != "ок"]
+        line = "Здоровье: " + " · ".join(parts)
+        if failing:
+            line += "\n⚠️ " + "; ".join(failing)
+        return line
 
     def cmd_price(self, args: List[str]) -> str:
         move = self.monitor.poll_price(alert=False)

@@ -6,11 +6,15 @@ thread, so every access goes through a re-entrant lock.
 """
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_items (
@@ -201,11 +205,22 @@ class Storage:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
+        self._configure_connection()
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
             self._apply_migrations()
+
+    def _configure_connection(self) -> None:
+        # WAL survives crashes better and lets the command thread read while
+        # the main loop writes; both pragmas are no-ops for ":memory:" DBs.
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.DatabaseError as exc:  # pragma: no cover - e.g. network filesystems
+            logger.warning("Could not set SQLite pragmas: %s", exc)
 
     def _apply_migrations(self) -> None:
         for table, column, ddl in MIGRATIONS:
@@ -588,4 +603,18 @@ class Storage:
             deleted += self._conn.execute("DELETE FROM clusters WHERE last_seen_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM price_history WHERE fetched_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM onchain_transfers WHERE utime < ?", (cutoff,)).rowcount
-            return deleted
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.DatabaseError:  # pragma: no cover
+                pass
+        return deleted
+
+    def size_bytes(self) -> int:
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total

@@ -53,7 +53,7 @@ Telegram: сигнал + контекст цены (CoinGecko → Binance → By
   Отвечает только чату из `TELEGRAM_CHAT_ID`.
 - Устойчивость: любой упавший источник, провайдер цены или ошибка Telegram
   не останавливают цикл; корректное завершение по Ctrl+C / SIGTERM; авто-
-  очистка базы (`RETENTION_DAYS`).
+  очистка базы (`RETENTION_DAYS`). Подробнее — в разделе «Автономная работа».
 
 ## Быстрый старт (macOS / Linux)
 
@@ -75,6 +75,33 @@ cp .env.example .env          # вписать TELEGRAM_BOT_TOKEN и TELEGRAM_CH
 
 ## Запуск 24/7
 
+### Автономная работа
+
+`python main.py` запускает бота под встроенным **супервизором** — второй
+лёгкий процесс, который перезапускает бота при любом падении (пауза
+5 → 15 → 30 → 60 → 120 → 300 с, сбрасывается после 10 мин стабильной работы).
+Ctrl+C / SIGTERM останавливают оба процесса без перезапуска.
+
+Внутри бота:
+
+- **Watchdog** — если главный цикл не подаёт признаков жизни
+  `WATCHDOG_TIMEOUT_MINUTES` (20) или память превысила `MAX_MEMORY_MB` (512),
+  бот завершается с кодом 75/76 и супервизор поднимает его заново.
+- **Память под контролем** — SQLite в режиме WAL с чекпоинтом после
+  ежедневной очистки, лог с ротацией (`LOG_FILE`, 5 МБ × 3), ончейн-сканер
+  читает цепочку страницами и не накапливает историю в памяти.
+- **Уведомления о здоровье** — если ленты, цена, ончейн или сам Telegram
+  недоступны дольше `HEALTH_ALERT_MINUTES` (60), приходит одно сообщение
+  «⚠️ … недоступен» и одно «✅ … снова работает». `/status` показывает
+  память, размер базы, число перезапусков подряд и проблемные компоненты.
+- **Telegram-лимиты** — при `429 Too Many Requests` бот ждёт, сколько просит
+  API, и повторяет; сообщение с ошибкой разметки уходит обычным текстом.
+- Приветствие после перезапуска содержит его причину; при серии из ≥ 3
+  перезапусков подряд стартовые сообщения не отправляются, чтобы не спамить.
+- `python main.py --healthcheck` возвращает 0, если файл «пульса»
+  (`HEARTBEAT_PATH`, по умолчанию `<DATABASE_PATH>.heartbeat`) свежий —
+  используется Docker `HEALTHCHECK`.
+
 ### Вариант A — на Mac (launchd)
 
 ```bash
@@ -86,16 +113,63 @@ Mac должен быть включён и не спать (Настройки 
 или `caffeinate`). Не запускайте одновременно `main.py` вручную — будут двойные
 уведомления и конфликт `getUpdates`.
 
-### Вариант B — VPS / сервер (Docker)
+### Вариант B — VPS / сервер (Docker, рекомендуется)
 
 ```bash
 docker compose up -d --build      # бот
 docker compose logs -f grambot    # логи
+docker compose ps                 # колонка STATUS: healthy / unhealthy
 docker compose --profile rsshub up -d   # + собственный RSSHub для Telegram-каналов
 ```
 
+`docker-compose.yml` уже содержит `restart: unless-stopped`, ротацию логов,
+лимит памяти 768 МБ, `HEALTHCHECK` и постоянный том `/data` для базы. Часовой
+пояс задаётся переменной `TZ` (по умолчанию `Europe/Moscow`). Обновление:
+`git pull && docker compose up -d --build`.
+
 При своём RSSHub укажите в `.env`
 `RSS_FEEDS=...,http://rsshub:1200/telegram/channel/tonblockchain,...`.
+
+### Вариант C — VPS без Docker (systemd)
+
+```ini
+# /etc/systemd/system/grambot.service
+[Unit]
+Description=GRAM/TON monitor bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=grambot
+WorkingDirectory=/opt/grambot
+EnvironmentFile=/opt/grambot/.env
+ExecStart=/opt/grambot/.venv/bin/python main.py --no-supervise
+Restart=always
+RestartSec=10
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now grambot
+journalctl -u grambot -f
+```
+
+С `--no-supervise` перезапусками занимается systemd; без флага — встроенный
+супервизор (тоже допустимо).
+
+### Что нужно от хостинга
+
+- 1 vCPU, 512 МБ–1 ГБ RAM, Python 3.9+ или Docker.
+- Постоянный диск для SQLite (том `/data` в Docker) — иначе после перезапуска
+  бот забудет, о чём уже писал, и пришлёт старые новости повторно.
+- Трафик: ончейн-сканер читает всю цепочку TON — около 2 ГБ/день. На хостинге
+  с лимитом трафика задайте `ENABLE_ONCHAIN=false` или получите бесплатный
+  ключ у [@tonapibot](https://t.me/tonapibot) (`TONCENTER_API_KEY`), чтобы
+  сканер не упирался в лимит запросов.
+- Только один экземпляр бота на один токен.
 
 ## Источники по умолчанию
 
