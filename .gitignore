@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.log
+.env
+.pytest_cache/
+*.heartbeat
+*.heartbeat.tmp
+*.db-wal
+*.db-shm

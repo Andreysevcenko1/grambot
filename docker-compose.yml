@@ -1,0 +1,39 @@
+services:
+  grambot:
+    build: .
+    container_name: grambot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /data/grambot.db
+      HEARTBEAT_PATH: /data/grambot.heartbeat
+      TZ: ${TZ:-Europe/Riga}
+    volumes:
+      - grambot-data:/data
+    # Hard ceiling; the bot's own watchdog restarts it at MAX_MEMORY_MB (512 by
+    # default) well before the kernel would OOM-kill the container.
+    mem_limit: 768m
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: your own RSSHub instance for Telegram channels (and X, Reddit…).
+  # Start with:  docker compose --profile rsshub up -d
+  # Then point RSS_FEEDS at http://rsshub:1200/telegram/channel/<name>
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: grambot-rsshub
+    profiles: ["rsshub"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: memory
+      CACHE_EXPIRE: "300"
+    ports:
+      - "127.0.0.1:1200:1200"
+
+volumes:
+  grambot-data:
