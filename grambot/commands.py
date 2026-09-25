@@ -36,6 +36,21 @@ logger = logging.getLogger(__name__)
 OFFSET_KEY = "tg_update_offset"
 MUTED_UNTIL_KEY = "muted_until"
 
+
+def describe_sender(message: Dict[str, Any]) -> str:
+    """Human-readable sender for the log: '@user Имя Фамилия, группа «Title»'."""
+    sender = message.get("from") or {}
+    parts: List[str] = []
+    if sender.get("username"):
+        parts.append("@" + str(sender["username"]))
+    name = " ".join(str(sender.get(k)) for k in ("first_name", "last_name") if sender.get(k))
+    if name:
+        parts.append(name)
+    chat = message.get("chat") or {}
+    if chat.get("title"):
+        parts.append(f"{chat.get('type', 'chat')} «{chat['title']}»")
+    return ", ".join(parts) or "без имени"
+
 COMMANDS = [
     ("status", "Состояние бота"),
     ("price", "Цена TON и движение"),
@@ -152,10 +167,14 @@ class CommandHandler(threading.Thread):
             return
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = (message.get("text") or "").strip()
-        if not text.startswith("/"):
-            return
         if chat_id != self.allowed_chat_id:
-            logger.info("Ignoring command from unauthorized chat %s", chat_id)
+            # Strangers get no reply, but the owner can see who knocked in the log.
+            logger.info(
+                "Ignoring message from unauthorized chat %s (%s): %s",
+                chat_id, describe_sender(message), text[:80] or "<без текста>",
+            )
+            return
+        if not text.startswith("/"):
             return
         logger.info("Command %s", text.split()[0])
         reply = self.handle_command(text)

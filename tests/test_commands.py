@@ -2,7 +2,7 @@ import time
 from unittest.mock import patch
 
 from grambot import price as price_module
-from grambot.commands import CommandHandler, MUTED_UNTIL_KEY
+from grambot.commands import CommandHandler, MUTED_UNTIL_KEY, describe_sender
 
 from .conftest import make_item
 
@@ -11,10 +11,29 @@ def handler_for(monitor):
     return CommandHandler(monitor, monitor.notifier)
 
 
-def test_unauthorized_chat_is_ignored(monitor):
+def test_unauthorized_chat_is_ignored_but_logged(monitor, caplog):
     handler = handler_for(monitor)
-    handler.handle_update({"update_id": 1, "message": {"chat": {"id": 999}, "text": "/status"}})
+    with caplog.at_level("INFO", logger="grambot.commands"):
+        handler.handle_update({
+            "update_id": 1,
+            "message": {
+                "chat": {"id": 999, "type": "private"},
+                "from": {"id": 999, "username": "stranger", "first_name": "Иван"},
+                "text": "/status",
+            },
+        })
+        handler.handle_update({"update_id": 2, "message": {"chat": {"id": 998}, "sticker": {}}})
     assert monitor.notifier.sent_to == []
+    assert "unauthorized chat 999 (@stranger, Иван): /status" in caplog.text
+    assert "unauthorized chat 998 (без имени): <без текста>" in caplog.text
+
+
+def test_describe_sender_includes_group_title():
+    message = {
+        "from": {"first_name": "Anna", "last_name": "K"},
+        "chat": {"id": -5, "type": "supergroup", "title": "TON chat"},
+    }
+    assert describe_sender(message) == "Anna K, supergroup «TON chat»"
 
 
 def test_status_and_help(monitor):
