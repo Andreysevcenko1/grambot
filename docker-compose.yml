@@ -7,7 +7,7 @@ services:
     environment:
       DATABASE_PATH: /data/grambot.db
       HEARTBEAT_PATH: /data/grambot.heartbeat
-      TZ: ${TZ:-Europe/Moscow}
+      TZ: ${TZ:-Europe/Riga}
     volumes:
       - grambot-data:/data
     # Hard ceiling; the bot's own watchdog restarts it at MAX_MEMORY_MB (512 by

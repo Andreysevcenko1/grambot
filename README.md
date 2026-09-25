@@ -124,13 +124,33 @@ docker compose --profile rsshub up -d   # + собственный RSSHub для
 
 `docker-compose.yml` уже содержит `restart: unless-stopped`, ротацию логов,
 лимит памяти 768 МБ, `HEALTHCHECK` и постоянный том `/data` для базы. Часовой
-пояс задаётся переменной `TZ` (по умолчанию `Europe/Moscow`). Обновление:
+пояс задаётся переменной `TZ` (по умолчанию `Europe/Riga`). Обновление:
 `git pull && docker compose up -d --build`.
 
 При своём RSSHub укажите в `.env`
 `RSS_FEEDS=...,http://rsshub:1200/telegram/channel/tonblockchain,...`.
 
-### Вариант C — VPS без Docker (systemd)
+### Вариант C — VPS без Docker (systemd, например Google Cloud VM)
+
+```bash
+sudo apt install -y git python3-venv          # если ещё нет
+git clone https://github.com/Andreysevcenko1/grambot.git ~/grambot && cd ~/grambot
+cp .env.example .env && nano .env             # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+./scripts/install_systemd.sh                  # venv + зависимости + сервис grambot, автостарт
+sudo journalctl -u grambot -f                 # логи
+```
+
+Скрипт создаёт `/etc/systemd/system/grambot.service` (`Restart=always`,
+лимит памяти `MEMORY_MAX`, по умолчанию 400M; часовой пояс `BOT_TZ`, по
+умолчанию `Europe/Riga`) и запускает бота с `--no-supervise` — перезапусками
+занимается systemd. Обновление: `git pull && ./scripts/install_systemd.sh`.
+Остановить: `sudo systemctl stop grambot`.
+
+На маленькой VM (1 ГБ RAM, e2-micro) вместе с другими ботами задайте в `.env`
+`MAX_MEMORY_MB=300`, чтобы встроенный watchdog перезапускал бота раньше
+лимита systemd.
+
+Ручной вариант юнита, если скрипт не подходит:
 
 ```ini
 # /etc/systemd/system/grambot.service
@@ -142,7 +162,7 @@ Wants=network-online.target
 [Service]
 User=grambot
 WorkingDirectory=/opt/grambot
-EnvironmentFile=/opt/grambot/.env
+Environment=TZ=Europe/Riga
 ExecStart=/opt/grambot/.venv/bin/python main.py --no-supervise
 Restart=always
 RestartSec=10
@@ -165,10 +185,12 @@ journalctl -u grambot -f
 - 1 vCPU, 512 МБ–1 ГБ RAM, Python 3.9+ или Docker.
 - Постоянный диск для SQLite (том `/data` в Docker) — иначе после перезапуска
   бот забудет, о чём уже писал, и пришлёт старые новости повторно.
-- Трафик: ончейн-сканер читает всю цепочку TON — около 2 ГБ/день. На хостинге
-  с лимитом трафика задайте `ENABLE_ONCHAIN=false` или получите бесплатный
-  ключ у [@tonapibot](https://t.me/tonapibot) (`TONCENTER_API_KEY`), чтобы
-  сканер не упирался в лимит запросов.
+- Трафик: ончейн-сканер читает всю цепочку TON — около 1–2 ГБ/день
+  **входящего** трафика (у Google Cloud и большинства VPS он бесплатный,
+  исходящий у бота мизерный). На хостинге с лимитом трафика задайте
+  `ENABLE_ONCHAIN=false` или получите бесплатный ключ у
+  [@tonapibot](https://t.me/tonapibot) (`TONCENTER_API_KEY`), чтобы сканер
+  не упирался в лимит запросов.
 - Только один экземпляр бота на один токен.
 
 ## Источники по умолчанию
