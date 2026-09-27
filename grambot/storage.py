@@ -148,6 +148,9 @@ class SignalStats:
     total_price: int = 0
     total_onchain: int = 0
     total_futures: int = 0
+    total_impulse: int = 0
+    impulse_evaluated: int = 0  # impulses with a price 1h later
+    impulse_continued: int = 0  # ...where the price kept going the same way
     evaluated_1h: int = 0
     hits_1h: int = 0
     avg_abs_move_1h: Optional[float] = None
@@ -515,6 +518,15 @@ class Storage:
         stats.total_onchain = int(row["c"]) if row else 0
         row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'futures'")
         stats.total_futures = int(row["c"]) if row else 0
+        impulses = self._query("SELECT sentiment, price_at_send, price_after_1h FROM signals WHERE kind = 'impulse'")
+        stats.total_impulse = len(impulses)
+        for r in impulses:
+            base, after = r["price_at_send"], r["price_after_1h"]
+            if not base or after is None or r["sentiment"] not in ("positive", "negative"):
+                continue
+            stats.impulse_evaluated += 1
+            if (after - base) * (1 if r["sentiment"] == "positive" else -1) > 0:
+                stats.impulse_continued += 1
         rows = self._query(
             "SELECT sentiment, price_at_send, price_after_1h, price_after_24h FROM signals WHERE kind = 'news'"
         )

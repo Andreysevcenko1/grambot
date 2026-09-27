@@ -92,7 +92,9 @@ def parse_windows(raw: str) -> List[Tuple[int, float]]:
     return sorted(windows.items())
 
 
-DEFAULT_PRICE_ALERT_WINDOWS = "60:3.5,240:6,1440:10"
+# Calibrated on 30 days of 5-minute GRAMUSDT candles: 2.5%/1h is roughly the
+# 99.3rd percentile of hourly moves (~0.4 alerts a day with the hysteresis).
+DEFAULT_PRICE_ALERT_WINDOWS = "60:2.5,240:5,1440:8"
 
 
 DEFAULT_RSS_FEEDS = [
@@ -162,12 +164,19 @@ class Settings:
     min_sources_for_verified: int = 2
     max_notifications_per_hour: int = 10
     price_window_minutes: int = 20
-    price_alert_threshold_pct: float = 5.0
+    price_alert_threshold_pct: float = 4.0
     price_alert_cooldown_minutes: int = 60
     # Slower windows (minutes, pct) for gradual moves; the fast window above is always added.
     price_alert_windows: List[Tuple[int, float]] = field(
         default_factory=lambda: parse_windows(DEFAULT_PRICE_ALERT_WINDOWS)
     )
+    # Early warning ("impulse"): a fast-window move that the hourly change
+    # confirms in the same direction. Fires before the windows above, is
+    # labelled unconfirmed and never blocks the regular price alert.
+    enable_impulse_alerts: bool = True
+    impulse_fast_pct: float = 2.0  # |change| over the fast window; ~99.7th percentile of 20-min moves for GRAM
+    impulse_slow_pct: float = 1.5  # ...while the 1h change points the same way
+    impulse_cooldown_minutes: int = 60
     enable_volume_alerts: bool = True
     volume_poll_interval_seconds: int = 300
     volume_spike_ratio: float = 4.0  # trailing-hour volume vs median hourly volume of the previous day
@@ -242,9 +251,13 @@ class Settings:
             min_sources_for_verified=max(1, _env_int("MIN_SOURCES_FOR_VERIFIED", 2)),
             max_notifications_per_hour=max(1, _env_int("MAX_NOTIFICATIONS_PER_HOUR", 10)),
             price_window_minutes=max(1, _env_int("PRICE_WINDOW_MINUTES", 20)),
-            price_alert_threshold_pct=max(0.1, _env_float("PRICE_ALERT_THRESHOLD_PCT", 5.0)),
+            price_alert_threshold_pct=max(0.1, _env_float("PRICE_ALERT_THRESHOLD_PCT", 4.0)),
             price_alert_cooldown_minutes=max(0, _env_int("PRICE_ALERT_COOLDOWN_MINUTES", 60)),
             price_alert_windows=parse_windows(os.getenv("PRICE_ALERT_WINDOWS", DEFAULT_PRICE_ALERT_WINDOWS)),
+            enable_impulse_alerts=_env_bool("ENABLE_IMPULSE_ALERTS", True),
+            impulse_fast_pct=max(0.1, _env_float("IMPULSE_FAST_PCT", 2.0)),
+            impulse_slow_pct=max(0.0, _env_float("IMPULSE_SLOW_PCT", 1.5)),
+            impulse_cooldown_minutes=max(0, _env_int("IMPULSE_COOLDOWN_MINUTES", 60)),
             enable_volume_alerts=_env_bool("ENABLE_VOLUME_ALERTS", True),
             volume_poll_interval_seconds=max(60, _env_int("VOLUME_POLL_INTERVAL_SECONDS", 300)),
             volume_spike_ratio=max(1.5, _env_float("VOLUME_SPIKE_RATIO", 4.0)),

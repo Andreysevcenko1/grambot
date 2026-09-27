@@ -233,6 +233,26 @@ def format_price_alert(
     return truncate("\n".join(lines))
 
 
+def format_impulse_alert(move: PriceMove, fast_minutes: int, causes: Sequence[Any] = ()) -> str:
+    """Early warning: a fast move confirmed by the hourly direction, but not yet
+    large enough for a regular price alert."""
+    change = move.window_changes.get(fast_minutes)
+    if change is None:
+        change = move.window_change_pct or 0.0
+    lines = [f"⚡ Импульс TON: {fmt_pct(change)} за {fmt_window(fast_minutes)}", ""]
+    lines.extend(format_price_context(move))
+    lines.append("")
+    lines.extend(format_causes(causes))
+    lines.append("")
+    direction = "рост" if change > 0 else "падение"
+    lines.append(
+        "Раннее предупреждение: движение ещё не подтверждено, такие импульсы часто не продолжаются. "
+        f"Если {direction} продолжится, придёт обычный сигнал."
+    )
+    lines.append(DISCLAIMER)
+    return truncate("\n".join(lines))
+
+
 def format_volume_alert(move: PriceMove, causes: Sequence[Any] = ()) -> str:
     """Alert for a trading-volume burst that is not (yet) a price alert."""
     ratio = move.volume_1h_ratio or 0.0

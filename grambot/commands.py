@@ -275,6 +275,12 @@ class CommandHandler(threading.Thread):
             f"{fmt_pct(threshold, 1).lstrip('+')}/{fmt_window(minutes)}" for minutes, threshold in self.settings.all_price_windows
         )
         line = f"Алерты цены: {windows}"
+        if self.settings.enable_impulse_alerts:
+            line += (
+                f"; импульс {fmt_pct(self.settings.impulse_fast_pct, 1).lstrip('+')}/{fmt_window(self.settings.price_window_minutes)}"
+            )
+            if self.settings.impulse_slow_pct > 0:
+                line += f" при {fmt_pct(self.settings.impulse_slow_pct, 1).lstrip('+')}/1 ч"
         if self.settings.enable_volume_alerts:
             client = self.monitor.volume_client
             if client.last_stats is not None:
@@ -414,10 +420,14 @@ class CommandHandler(threading.Thread):
 
     def cmd_stats(self, args: List[str]) -> str:
         s = self.storage.signal_stats()
+        impulses = f"Импульсов (ранних предупреждений): {s.total_impulse}"
+        if s.impulse_evaluated:
+            impulses += f", продолжились через 1ч: {s.impulse_continued} из {s.impulse_evaluated}"
         lines = [
             "📈 <b>Статистика сигналов</b>",
             f"Новостных сигналов: {s.total_news}",
             f"Ценовых алертов: {s.total_price}",
+            impulses,
             f"Ончейн-сигналов: {s.total_onchain}",
             f"Сигналов по деривативам: {s.total_futures}",
         ]

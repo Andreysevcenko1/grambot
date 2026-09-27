@@ -231,6 +231,23 @@ def is_volume_spike(move: PriceMove, min_ratio: float, min_move_pct: float) -> b
     return change_1h is not None and abs(change_1h) >= min_move_pct
 
 
+def impulse(move: PriceMove, fast_minutes: int, fast_pct: float, slow_pct: float) -> Optional[Tuple[float, float]]:
+    """Early-warning check: (fast change, 1h change) when the fast window moved
+    at least ``fast_pct`` and the hourly change confirms the direction with at
+    least ``slow_pct``; ``None`` otherwise.
+
+    The hourly confirmation filters out a spike that merely retraces the
+    previous half hour. ``slow_pct <= 0`` disables it.
+    """
+    fast = move.window_changes.get(fast_minutes)
+    if fast is None or abs(fast) < fast_pct:
+        return None
+    slow = move.window_changes.get(60)
+    if slow_pct > 0 and (slow is None or abs(slow) < slow_pct or slow * fast <= 0):
+        return None
+    return fast, (slow if slow is not None else fast)
+
+
 __all__ = [
     "Candle",
     "VolumeClient",
@@ -239,6 +256,7 @@ __all__ = [
     "fetch_klines_binance",
     "fetch_klines_bybit",
     "fetch_klines_okx",
+    "impulse",
     "is_volume_spike",
     "strongest_window",
     "triggered_windows",
