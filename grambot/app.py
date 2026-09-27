@@ -10,14 +10,17 @@ import threading
 import time
 from typing import List, Optional, Sequence, Tuple
 
+from . import derivatives as derivatives_module
 from . import market as market_module
 from . import onchain as onchain_module
 from . import price as price_module
 from .commands import MUTED_UNTIL_KEY, CommandHandler
 from .config import Settings
+from .derivatives import FuturesClient, FuturesSnapshot, LiquidationStats
 from .health import HealthEvent, HealthTracker, Watchdog, format_health_event, heartbeat_age, write_heartbeat
 from .notifier import (
     TelegramNotifier,
+    format_futures_alert,
     format_network_alert,
     format_news_alert,
     format_price_alert,
@@ -31,6 +34,7 @@ from .processing.classifier import Classifier, RuleBasedClassifier, meets_min_st
 from .processing.clustering import find_matching_cluster, new_cluster_id
 from .processing.filters import filter_fresh, filter_relevant
 from .processing.llm_classifier import LLMClassifier
+from .processing.whale_alert import is_transfer_post, is_whale_alert_item, parse_transfer
 from .sources import NewsItem
 from .sources.rss import FeedResult, RSSSource
 from .sources.telegram_web import channel_from_post_url, channel_from_url
@@ -48,6 +52,12 @@ LAST_PRUNE_KEY = "last_prune_at"
 ONCHAIN_LAST_UTIME_KEY = "onchain_last_utime"
 LAST_WHALE_ALERT_KEY = "last_whale_alert_at"
 NETWORK_STALLED_SINCE_KEY = "network_stalled_since"
+FUTURES_FUNDING_FIRED_KEY = "futures_funding_fired"
+FUTURES_OI_FIRED_KEY = "futures_oi_fired_{minutes}"
+FUTURES_LIQ_FIRED_KEY = "futures_liq_fired"
+LAST_FUTURES_ALERT_KEY = "last_futures_alert_{kind}"
+WHALE_ALERT_CHANNEL = "whale_alert_io"
+WHALE_ALERT_MAX_AGE_SECONDS = 1800  # older Whale Alert posts are recorded for /whales but not alerted
 ONCHAIN_STUCK_FAILURES = 5
 ONCHAIN_STUCK_SKIP_SECONDS = 60
 COMMAND_HANDLER_RESTART_DELAY = 30.0
@@ -113,6 +123,18 @@ class GramTonMonitor:
         self.last_scan: Optional[ScanResult] = None
         self.last_masterchain: Optional[MasterchainState] = None
         self._onchain_failures = 0
+        # Whale Alert's Telegram channel feeds the whale monitor without TON Center.
+        self.whale_alert_enabled = any(
+            (channel_from_url(feed) or "").lower() == WHALE_ALERT_CHANNEL for feed in settings.rss_feeds
+        )
+
+        self.futures_enabled = settings.enable_futures_alerts
+        self.futures_client = FuturesClient(symbol=settings.price_symbol)
+        self._futures_lock = threading.Lock()
+        self.last_futures_poll_at: Optional[float] = None
+        self.last_futures_snapshot: Optional[FuturesSnapshot] = None
+        self.last_liquidations: Optional[LiquidationStats] = None
+        self._futures_stored_at: float = 0.0
 
         self.health = HealthTracker(alert_after_seconds=settings.health_alert_minutes * 60)
         self.heartbeat_at = time.monotonic()
@@ -187,6 +209,12 @@ class GramTonMonitor:
 
             items: List[NewsItem] = [item for r in results for item in r.items]
             fresh = filter_fresh(items, self.settings.max_item_age_hours)
+            # Whale Alert transfer lines are data, not headlines: route them to
+            # the whale monitor and keep them out of clustering/verification.
+            transfer_posts = [item for item in fresh if is_whale_alert_item(item) and is_transfer_post(item)]
+            if transfer_posts:
+                skipped = {id(item) for item in transfer_posts}
+                fresh = [item for item in fresh if id(item) not in skipped]
             relevant = filter_relevant(fresh, self.settings.keywords)
             # Oldest first so corroboration and clustering follow the timeline.
             relevant.sort(key=lambda i: i.published_at)
@@ -203,15 +231,52 @@ class GramTonMonitor:
                 except Exception:  # pragma: no cover - one bad item must not stop the poll
                     logger.exception("Failed to process item %r", item.title)
 
+            whale_transfers = self._ingest_whale_alert_posts(transfer_posts)
+
             ok_feeds = sum(1 for r in results if r.ok)
             logger.info(
-                "Poll done: feeds %d/%d ok, %d items, %d fresh, %d relevant, %d new, %d notified",
-                ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified,
+                "Poll done: feeds %d/%d ok, %d items, %d fresh, %d relevant, %d new, %d notified, %d whale transfer(s)",
+                ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified, len(whale_transfers),
             )
         if results:
             first_error = next((r.error for r in results if not r.ok and r.error), None)
             self._report_health("feeds", ok_feeds > 0, first_error)
+        for transfer in whale_transfers:
+            if transfer.amount_ton < self.settings.whale_min_ton or transfer.kind not in onchain_module.ALERT_KINDS:
+                continue
+            if time.time() - transfer.utime > WHALE_ALERT_MAX_AGE_SECONDS:
+                # First poll after a (re)start sees the channel's whole recent page.
+                logger.info("Whale Alert transfer %.0f TON is %.0f min old; recorded without alert", transfer.amount_ton, (time.time() - transfer.utime) / 60)
+                continue
+            self._safe(self._maybe_whale_alert, transfer)
         return notified
+
+    def _ingest_whale_alert_posts(self, posts: Sequence[NewsItem]) -> List[Transfer]:
+        """Record new TON/GRAM transfers reported by Whale Alert; returns them oldest first."""
+        transfers: List[Transfer] = []
+        for item in sorted(posts, key=lambda i: i.published_at):
+            try:
+                transfer = parse_transfer(item)
+            except Exception:  # pragma: no cover - a malformed post must not stop the poll
+                logger.exception("Failed to parse Whale Alert post %r", item.title)
+                continue
+            if transfer is None:
+                continue  # another coin
+            inserted = self.storage.record_transfer(
+                transfer.hash,
+                transfer.utime,
+                transfer.source,
+                transfer.destination,
+                transfer.amount_ton,
+                transfer.source_label.display() if transfer.source_label else None,
+                transfer.destination_label.display() if transfer.destination_label else None,
+                transfer.kind,
+                link=transfer.link,
+            )
+            if inserted:
+                transfers.append(transfer)
+                logger.info("Whale Alert: %.0f TON %s (%s → %s)", transfer.amount_ton, transfer.kind, transfer.source, transfer.destination)
+        return transfers
 
     def _process_item(self, item: NewsItem) -> bool:
         """Cluster, verify, classify and (maybe) notify. Returns True if sent."""
@@ -648,6 +713,168 @@ class GramTonMonitor:
             info["seqno"] = self.last_masterchain.seqno
         return info
 
+    # -- derivatives -----------------------------------------------------------
+    def poll_futures(self, alert: bool = True) -> Optional[FuturesSnapshot]:
+        """Funding / open interest snapshot (+ OKX liquidations), history and alerts."""
+        if not self.futures_enabled:
+            return None
+        with self._futures_lock:
+            self.last_futures_poll_at = time.time()
+            snapshot = self.futures_client.fetch()
+            if snapshot is None:
+                if self.futures_client.last_error:
+                    logger.warning("All futures providers failed (%s)", self.futures_client.last_error)
+                    self._report_health("futures", False, self.futures_client.last_error)
+                return None
+            self._report_health("futures", True)
+            if snapshot.fetched_at != self._futures_stored_at:  # fetch() may return the cached snapshot
+                self.storage.add_futures_point(
+                    snapshot.provider,
+                    snapshot.open_interest,
+                    snapshot.open_interest_usd,
+                    snapshot.funding_rate,
+                    snapshot.mark_price,
+                    fetched_at=snapshot.fetched_at,
+                )
+                self._futures_stored_at = snapshot.fetched_at
+            snapshot.oi_changes = derivatives_module.oi_changes(
+                self.storage, snapshot, [minutes for minutes, _ in self.settings.oi_alert_windows]
+            )
+            self.last_futures_snapshot = snapshot
+            liquidations = None
+            if self.settings.liquidation_alert_usd > 0:
+                liquidations = self.futures_client.fetch_liquidations() or self.futures_client.last_liquidations
+                self.last_liquidations = liquidations
+            logger.info(
+                "Futures (%s): funding %s/day, OI %s, changes %s, liquidations/h %s",
+                snapshot.provider,
+                f"{snapshot.funding_daily_pct:+.3f}%" if snapshot.funding_daily_pct is not None else "n/a",
+                f"{snapshot.open_interest:,.0f}" if snapshot.open_interest is not None else "n/a",
+                {m: round(c, 2) for m, c in snapshot.oi_changes.items()} or "-",
+                f"${liquidations.total_usd:,.0f}" if liquidations else "n/a",
+            )
+        if alert:
+            self._maybe_futures_alert(snapshot, liquidations)
+        return snapshot
+
+    def _futures_fired(self, key: str) -> bool:
+        return self.storage.get_value(key) is not None
+
+    def _rearm_futures(self, snapshot: FuturesSnapshot, liquidations: Optional[LiquidationStats]) -> None:
+        """Each trigger re-arms once its reading falls below half the threshold."""
+        s = self.settings
+        daily = snapshot.funding_daily_pct
+        if daily is not None and abs(daily) < s.funding_alert_daily_pct / 2 and self._futures_fired(FUTURES_FUNDING_FIRED_KEY):
+            self.storage.set_value(FUTURES_FUNDING_FIRED_KEY, None)
+            logger.info("Funding alert re-armed (%.3f%%/day)", daily)
+        for minutes, threshold in s.oi_alert_windows:
+            change = snapshot.oi_changes.get(minutes)
+            key = FUTURES_OI_FIRED_KEY.format(minutes=minutes)
+            if change is not None and abs(change) < threshold / 2 and self._futures_fired(key):
+                self.storage.set_value(key, None)
+                logger.info("OI window %d min re-armed (%.2f%%)", minutes, change)
+        if liquidations is not None and liquidations.total_usd < s.liquidation_alert_usd / 2 and self._futures_fired(FUTURES_LIQ_FIRED_KEY):
+            self.storage.set_value(FUTURES_LIQ_FIRED_KEY, None)
+            logger.info("Liquidation alert re-armed ($%.0f/h)", liquidations.total_usd)
+
+    def _futures_ready(self, kind: str, fired_key: str) -> bool:
+        if self._futures_fired(fired_key):
+            return False
+        last = self.storage.get_float(LAST_FUTURES_ALERT_KEY.format(kind=kind)) or 0.0
+        return time.time() - last >= self.settings.futures_alert_cooldown_minutes * 60
+
+    def _maybe_futures_alert(self, snapshot: FuturesSnapshot, liquidations: Optional[LiquidationStats]) -> bool:
+        """One informational message per poll covering every derivatives trigger
+        that is currently over its threshold; each trigger has hysteresis and a
+        per-type cooldown so a lasting condition is reported once."""
+        s = self.settings
+        self._rearm_futures(snapshot, liquidations)
+        funding_hit = derivatives_module.funding_is_extreme(snapshot, s.funding_alert_daily_pct)
+        oi_hits = derivatives_module.triggered_oi_windows(snapshot, s.oi_alert_windows)
+        liq_hit = (
+            liquidations is not None and s.liquidation_alert_usd > 0 and liquidations.total_usd >= s.liquidation_alert_usd
+        )
+        if not (funding_hit or oi_hits or liq_hit):
+            return False
+        if oi_hits or liq_hit:
+            self._mark_market_active()  # leverage is moving: single-source news may be confirmed
+
+        funding_armed = funding_hit and self._futures_ready("funding", FUTURES_FUNDING_FIRED_KEY)
+        oi_armed = [hit for hit in oi_hits if self._futures_ready("oi", FUTURES_OI_FIRED_KEY.format(minutes=hit[0]))]
+        liq_armed = liq_hit and self._futures_ready("liquidations", FUTURES_LIQ_FIRED_KEY)
+        if not (funding_armed or oi_armed or liq_armed):
+            logger.info("Futures triggers (funding=%s oi=%s liq=%s) already reported or in cooldown", funding_hit, bool(oi_hits), liq_hit)
+            return False
+        allowed, why = self.can_notify()
+        if not allowed:
+            logger.info("Futures alert suppressed (%s)", why)
+            return False
+
+        oi_hit = derivatives_module.strongest_oi_window(oi_armed or oi_hits)
+        move = self._safe(self.current_price_move)
+        causes = self.recent_causes() if liq_armed else []
+        asset = derivatives_module.base_asset(s.price_symbol)
+        message = format_futures_alert(
+            snapshot,
+            liquidations,
+            asset=asset,
+            funding_hit=funding_hit,
+            oi_hit=oi_hit,
+            liquidation_hit=liq_hit and liq_armed,
+            move=move,
+            causes=causes,
+        )
+        if not self.notifier.send(message):
+            return False
+        now = time.time()
+        if funding_hit:
+            self.storage.set_value(FUTURES_FUNDING_FIRED_KEY, "1")
+            self.storage.set_value(LAST_FUTURES_ALERT_KEY.format(kind="funding"), str(now))
+        for minutes, _, _ in oi_hits:  # the message shows every window that is over its threshold
+            self.storage.set_value(FUTURES_OI_FIRED_KEY.format(minutes=minutes), "1")
+        if oi_hits:
+            self.storage.set_value(LAST_FUTURES_ALERT_KEY.format(kind="oi"), str(now))
+        if liq_hit:
+            self.storage.set_value(FUTURES_LIQ_FIRED_KEY, "1")
+            self.storage.set_value(LAST_FUTURES_ALERT_KEY.format(kind="liquidations"), str(now))
+
+        if liq_armed and liquidations is not None:
+            title = f"Ликвидации ${liquidations.total_usd:,.0f} за час (лонги {int((liquidations.long_share or 0) * 100)}%)".replace(",", " ")
+            strength = "high" if liquidations.total_usd >= 2 * s.liquidation_alert_usd else "medium"
+        elif oi_hit is not None and oi_armed:
+            title = f"Открытый интерес {oi_hit[1]:+.1f}% за {oi_hit[0]} мин"
+            strength = "high" if abs(oi_hit[1]) >= 2 * oi_hit[2] else "medium"
+        else:
+            title = f"Ставка финансирования {snapshot.funding_daily_pct or 0:+.2f}%/день"
+            strength = "high" if abs(snapshot.funding_daily_pct or 0) >= 2 * s.funding_alert_daily_pct else "medium"
+        self.storage.record_signal(
+            kind="futures",
+            title=title,
+            url=None,
+            sentiment="unknown",
+            strength=strength,
+            source_count=1,
+            price_at_send=move.price_usd if move else None,
+        )
+        logger.info("Futures alert sent: %s", title)
+        return True
+
+    def futures_status(self) -> dict:
+        """Summary for /status and /futures."""
+        client = self.futures_client
+        return {
+            "enabled": self.futures_enabled,
+            "provider": client.last_provider,
+            "error": client.last_error,
+            "liquidations_error": client.liquidations_error,
+            "last_poll_at": self.last_futures_poll_at,
+            "snapshot": self.last_futures_snapshot,
+            "liquidations": self.last_liquidations,
+            "history_seconds": (
+                self.storage.futures_history_span(self.last_futures_snapshot.provider) if self.last_futures_snapshot else 0.0
+            ),
+        }
+
     def update_signal_followups(self) -> int:
         """Fill in price 1h/24h after each sent signal (for /stats)."""
         now = time.time()
@@ -695,6 +922,7 @@ class GramTonMonitor:
         self._safe(self.poll_price)
         notified = self._safe(self.poll_news_once) or 0
         self._safe(self.poll_onchain)
+        self._safe(self.poll_futures)
         self._safe(self.update_signal_followups)
         return notified
 
@@ -737,16 +965,18 @@ class GramTonMonitor:
                     len(self.settings.rss_feeds), self.settings.keywords, self.classifier_name,
                     self.settings.enable_commands, onchain=self.onchain_enabled,
                     restart_count=self.restart_count, last_exit_code=self.last_exit_code,
+                    whale_alert=self.whale_alert_enabled, futures=self.futures_enabled,
                 )
             )
 
     def run_forever(self) -> int:
         self._install_signal_handlers()
         logger.info(
-            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss, on-chain %s",
+            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss, on-chain %s, futures %s",
             len(self.settings.rss_feeds), self.classifier_name,
             self.settings.poll_interval_seconds, self.settings.price_poll_interval_seconds,
             f"every {self.settings.onchain_poll_interval_seconds}s" if self.onchain_enabled else "disabled",
+            f"every {self.settings.futures_poll_interval_seconds}s" if self.futures_enabled else "disabled",
         )
         if self.restart_count:
             logger.warning("Restarted by supervisor (%d in a row, last exit code %s)", self.restart_count, self.last_exit_code)
@@ -758,6 +988,7 @@ class GramTonMonitor:
         next_news = now
         next_price = now
         next_onchain = now if self.onchain_enabled else float("inf")
+        next_futures = now if self.futures_enabled else float("inf")
         next_handler_check = now
         try:
             while not self.stop_event.is_set():
@@ -780,10 +1011,13 @@ class GramTonMonitor:
                     delay = 10 if catching_up else self.settings.onchain_poll_interval_seconds
                     backoff_left = max(0.0, self.ton_client.backoff_until - time.time())
                     next_onchain = time.monotonic() + max(delay, backoff_left)
+                if now >= next_futures:
+                    self._safe(self.poll_futures)
+                    next_futures = time.monotonic() + self.settings.futures_poll_interval_seconds
                 self._safe(self.maybe_prune)
                 self.beat()
 
-                timeout = max(1.0, min(next_news, next_price, next_onchain, next_handler_check) - time.monotonic())
+                timeout = max(1.0, min(next_news, next_price, next_onchain, next_futures, next_handler_check) - time.monotonic())
                 self.wake_event.wait(timeout)
                 self.wake_event.clear()
         finally:

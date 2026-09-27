@@ -31,6 +31,7 @@ COMPONENT_TITLES = {
     "feeds": "источники новостей",
     "price": "провайдеры цены",
     "onchain": "TON Center (ончейн)",
+    "futures": "данные деривативов (фьючерсы)",
     "telegram": "Telegram API",
 }
 

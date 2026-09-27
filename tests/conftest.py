@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from grambot import derivatives as derivatives_module
 from grambot import market as market_module
 from grambot import onchain as onchain_module
 from grambot import price as price_module
@@ -101,9 +102,12 @@ def monitor():
         mon = GramTonMonitor(settings, storage, source, RuleBasedClassifier(), notifier, classifier_name="test")
         # Never hit the network from tests: price/volume providers return
         # nothing unless a test patches them itself; fiat rates are fixed; TON
-        # Center calls fail fast and the labels dataset is never refreshed.
+        # Center calls fail fast, the labels dataset is never refreshed and the
+        # futures providers return nothing unless a test patches them.
         with patch.object(price_module.PriceClient, "fetch", return_value=None), patch.object(
             market_module.VolumeClient, "fetch", return_value=None
+        ), patch.object(derivatives_module.FuturesClient, "fetch", return_value=None), patch.object(
+            derivatives_module.FuturesClient, "fetch_liquidations", return_value=None
         ), patch.object(
             price_module.FiatRates, "get", side_effect=lambda cur: 1.0 if cur == "USD" else 0.9
         ), patch.object(

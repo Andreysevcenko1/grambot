@@ -98,10 +98,12 @@ class Transfer:
     kind: str
     source_friendly: str = ""
     destination_friendly: str = ""
+    link: str = ""  # off-chain report (e.g. a Whale Alert post) instead of an explorer link
+    usd_value: Optional[float] = None  # value as reported by the source, when known
 
     @property
     def url(self) -> str:
-        return f"https://tonviewer.com/transaction/{self.hash}"
+        return self.link or f"https://tonviewer.com/transaction/{self.hash}"
 
 
 @dataclass

@@ -6,10 +6,11 @@ import html
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
+from .derivatives import FuturesSnapshot, LiquidationStats, funding_note, positioning_note
 from .onchain import KIND_LABELS, Transfer
 from .price import PriceMove
 from .processing.classifier import Classification
@@ -255,6 +256,8 @@ def format_startup(
     onchain: bool = False,
     restart_count: int = 0,
     last_exit_code: Optional[int] = None,
+    whale_alert: bool = False,
+    futures: bool = False,
 ) -> str:
     title = "🤖 GRAM/TON монитор запущен"
     if restart_count:
@@ -266,11 +269,18 @@ def format_startup(
     ]
     if onchain:
         lines.append("Ончейн: крупные переводы и состояние сети — включено")
+    elif whale_alert:
+        lines.append("Крупные переводы: по данным Whale Alert")
+    if futures:
+        lines.append("Деривативы: финансирование, открытый интерес, ликвидации — включено")
     if commands_enabled:
-        commands = "/status /price /recent /stats /feeds /help"
-        if onchain:
-            commands = "/status /price /whales /recent /stats /feeds /help"
-        lines.append(f"Команды: {commands}")
+        commands = ["/status", "/price"]
+        if onchain or whale_alert:
+            commands.append("/whales")
+        if futures:
+            commands.append("/futures")
+        commands += ["/recent", "/stats", "/feeds", "/help"]
+        lines.append(f"Команды: {' '.join(commands)}")
     return "\n".join(lines)
 
 
@@ -285,6 +295,9 @@ def fmt_ton(value: float) -> str:
 
 
 def _party(label_text: Optional[str], friendly: str) -> str:
+    if not friendly:
+        # Off-chain reports (Whale Alert) name the entity but give no address.
+        return f"<b>{html.escape(label_text)}</b>" if label_text else "неизвестный кошелёк"
     short = f"{friendly[:6]}…{friendly[-4:]}" if len(friendly) > 12 else friendly
     link = f'<a href="https://tonviewer.com/{html.escape(friendly, quote=True)}">{html.escape(short)}</a>'
     if label_text:
@@ -295,7 +308,9 @@ def _party(label_text: Optional[str], friendly: str) -> str:
 def format_whale_alert(transfer: Transfer, sentiment: str, strength: str, move: Optional[PriceMove] = None) -> str:
     header_emoji = {"negative": "🔴", "positive": "🟢"}.get(sentiment, "⚪")
     amount = fmt_ton(transfer.amount_ton)
-    if move is not None:
+    if transfer.usd_value:
+        amount += f" (≈ {fmt_usd(transfer.usd_value)})"
+    elif move is not None:
         amount += f" (≈ {fmt_usd(transfer.amount_ton * move.price_usd)})"
     lines = [
         f"🐋 {header_emoji} Крупный перевод: <b>{amount}</b>",
@@ -309,7 +324,8 @@ def format_whale_alert(transfer: Transfer, sentiment: str, strength: str, move: 
     if price_lines:
         lines.append("")
         lines.extend(price_lines)
-    lines.extend(["", f'🔗 <a href="{html.escape(transfer.url, quote=True)}">Транзакция</a> · {fmt_time(transfer.utime)}', DISCLAIMER])
+    link_text = "Whale Alert" if transfer.link else "Транзакция"
+    lines.extend(["", f'🔗 <a href="{html.escape(transfer.url, quote=True)}">{link_text}</a> · {fmt_time(transfer.utime)}', DISCLAIMER])
     return truncate("\n".join(lines))
 
 
@@ -327,6 +343,189 @@ def format_network_alert(age_seconds: float, seqno: int, recovered: bool = False
         "Обычно блоки идут каждые ~5 секунд; проверьте официальные каналы @tonstatus и биржи (возможны задержки ввода/вывода).",
         DISCLAIMER,
     ])
+
+
+PROVIDER_TITLES = {"binance": "Binance Futures", "bybit": "Bybit", "okx": "OKX"}
+
+
+def fmt_amount_usd(value: Optional[float]) -> str:
+    """Like ``fmt_usd`` but for sums, where sub-dollar precision is noise."""
+    if value is not None and 0 <= value < 1e3:
+        return f"${value:,.0f}"
+    return fmt_usd(value)
+
+
+def fmt_coins(value: Optional[float], asset: str = "GRAM") -> str:
+    if value is None:
+        return "н/д"
+    if value >= 1e9:
+        return f"{value / 1e9:.2f} млрд {asset}".replace(".", ",")
+    if value >= 1e6:
+        return f"{value / 1e6:.1f} млн {asset}".replace(".", ",")
+    if value >= 1e3:
+        return f"{value / 1e3:.0f} тыс. {asset}"
+    return f"{value:.0f} {asset}"
+
+
+def _funding_line(snapshot: FuturesSnapshot) -> Optional[str]:
+    if snapshot.funding_rate is None:
+        return None
+    interval = snapshot.funding_interval_hours
+    interval_text = f"{interval:g} ч" if interval else "период"
+    line = f"Ставка финансирования: {fmt_pct(snapshot.funding_pct, 3)} за {interval_text}"
+    daily = snapshot.funding_daily_pct
+    if daily is not None:
+        line += f" (≈ {fmt_pct(daily, 2)}/день, {fmt_pct(snapshot.funding_annual_pct, 0)}/год)"
+    if snapshot.next_funding_at:
+        line += f" · следующая в {time.strftime('%H:%M', time.localtime(snapshot.next_funding_at))}"
+    return line
+
+
+def _oi_line(snapshot: FuturesSnapshot, asset: str) -> Optional[str]:
+    if snapshot.open_interest is None and snapshot.open_interest_usd is None:
+        return None
+    if snapshot.open_interest is not None:
+        text = fmt_coins(snapshot.open_interest, asset)
+        if snapshot.open_interest_usd:
+            text += f" (≈ {fmt_usd(snapshot.open_interest_usd)})"
+    else:
+        text = fmt_usd(snapshot.open_interest_usd)
+    changes = " · ".join(
+        f"{fmt_pct(change)} за {fmt_window(minutes)}" for minutes, change in sorted(snapshot.oi_changes.items())
+    )
+    line = f"Открытый интерес: {text}"
+    if changes:
+        line += f" · {changes}"
+    return line
+
+
+def _liquidation_line(stats: Optional[LiquidationStats]) -> Optional[str]:
+    if stats is None:
+        return None
+    window = fmt_window(int(round(stats.window_seconds / 60)))
+    if stats.total_usd <= 0:
+        return f"Ликвидации за {window}: не зафиксированы ({PROVIDER_TITLES.get(stats.provider, stats.provider)})"
+    prefix = "не менее " if stats.truncated else ""
+    line = f"Ликвидации за {window}: {prefix}{fmt_amount_usd(stats.total_usd)} — лонги {fmt_amount_usd(stats.long_usd)}, шорты {fmt_amount_usd(stats.short_usd)}"
+    line += f" ({PROVIDER_TITLES.get(stats.provider, stats.provider)}, {stats.count} ордеров)"
+    return line
+
+
+def _liquidation_note(stats: LiquidationStats) -> str:
+    share = stats.long_share or 0.0
+    if share >= 0.7:
+        return "ликвидируют в основном лонги — принудительные продажи усиливают падение, пока каскад не выдохнется"
+    if share <= 0.3:
+        return "ликвидируют в основном шорты — принудительные покупки подталкивают цену вверх (шорт-сквиз)"
+    return "ликвидации идут с обеих сторон — волатильность высокая, направление неясно"
+
+
+def futures_body(
+    snapshot: FuturesSnapshot,
+    liquidations: Optional[LiquidationStats],
+    asset: str,
+    price_change_pct: Optional[float] = None,
+    oi_hit: Optional[Tuple[int, float, float]] = None,
+    funding_hit: bool = False,
+    liquidation_hit: bool = False,
+) -> List[str]:
+    lines = [line for line in (_liquidation_line(liquidations), _oi_line(snapshot, asset), _funding_line(snapshot)) if line]
+    notes = []
+    if liquidation_hit and liquidations is not None:
+        notes.append(_liquidation_note(liquidations))
+    if oi_hit is not None:
+        notes.append(positioning_note(oi_hit[1], price_change_pct))
+    if funding_hit and snapshot.funding_daily_pct is not None:
+        notes.append(funding_note(snapshot.funding_daily_pct))
+    if notes:
+        lines.append("Что это значит: " + "; ".join(notes) + ".")
+    return lines
+
+
+def format_futures_alert(
+    snapshot: FuturesSnapshot,
+    liquidations: Optional[LiquidationStats],
+    asset: str = "GRAM",
+    funding_hit: bool = False,
+    oi_hit: Optional[Tuple[int, float, float]] = None,
+    liquidation_hit: bool = False,
+    move: Optional[PriceMove] = None,
+    causes: Sequence[Any] = (),
+) -> str:
+    """Informational alert about derivatives positioning. The headline is the
+    strongest trigger (liquidations > open interest > funding)."""
+    if liquidation_hit and liquidations is not None:
+        share = liquidations.long_share
+        side = ""
+        if share is not None:
+            side = f" (лонги {share * 100:.0f}%)" if share >= 0.5 else f" (шорты {(1 - share) * 100:.0f}%)"
+        prefix = "не менее " if liquidations.truncated else ""
+        head = f"⚡ Деривативы TON: ликвидации {prefix}{fmt_amount_usd(liquidations.total_usd)} за {fmt_window(int(round(liquidations.window_seconds / 60)))}{side}"
+    elif oi_hit is not None:
+        minutes, change, _ = oi_hit
+        head = f"📐 Деривативы TON: открытый интерес {fmt_pct(change)} за {fmt_window(minutes)}"
+    else:
+        head = f"💸 Деривативы TON: ставка финансирования {fmt_pct(snapshot.funding_daily_pct, 2)} в день"
+    price_change = None
+    if move is not None and oi_hit is not None:
+        price_change = move.window_changes.get(oi_hit[0])
+    lines = [head, ""]
+    lines.extend(futures_body(snapshot, liquidations, asset, price_change, oi_hit, funding_hit, liquidation_hit))
+    price_lines = format_price_context(move)
+    if price_lines:
+        lines.append("")
+        lines.extend(price_lines)
+    if liquidation_hit:
+        lines.append("")
+        lines.extend(format_causes(causes))
+    lines.append("")
+    lines.append(f"<i>Источник: {PROVIDER_TITLES.get(snapshot.provider, snapshot.provider)} · {fmt_time(snapshot.fetched_at)}</i>")
+    lines.append(DISCLAIMER)
+    return truncate("\n".join(lines))
+
+
+def format_futures_status(
+    snapshot: Optional[FuturesSnapshot],
+    liquidations: Optional[LiquidationStats],
+    asset: str = "GRAM",
+    funding_threshold_daily_pct: float = 0.0,
+    oi_windows: Sequence[Tuple[int, float]] = (),
+    liquidation_threshold_usd: float = 0.0,
+    history_seconds: float = 0.0,
+    error: Optional[str] = None,
+    move: Optional[PriceMove] = None,
+) -> str:
+    """``/futures`` reply: current derivatives context plus the alert thresholds."""
+    lines = ["📐 <b>Деривативы TON (бессрочные фьючерсы)</b>"]
+    if snapshot is None:
+        lines.append("Данные пока недоступны" + (f": {html.escape(error[:80])}" if error else "."))
+    else:
+        oi_hit = max(snapshot.oi_changes.items(), key=lambda kv: abs(kv[1])) if snapshot.oi_changes else None
+        price_change = move.window_changes.get(oi_hit[0]) if (move is not None and oi_hit) else None
+        lines.extend(
+            futures_body(
+                snapshot, liquidations, asset, price_change,
+                oi_hit=(oi_hit[0], oi_hit[1], 0.0) if oi_hit and abs(oi_hit[1]) >= 1.0 else None,
+            )
+        )
+        lines.append(f"<i>Источник: {PROVIDER_TITLES.get(snapshot.provider, snapshot.provider)} · {fmt_time(snapshot.fetched_at)}</i>")
+    thresholds = []
+    if funding_threshold_daily_pct > 0:
+        thresholds.append(f"финансирование ≥ {fmt_pct(funding_threshold_daily_pct, 2).lstrip('+')}/день")
+    if oi_windows:
+        thresholds.append("OI " + ", ".join(f"±{fmt_pct(t, 0).lstrip('+')}/{fmt_window(m)}" for m, t in oi_windows))
+    if liquidation_threshold_usd > 0:
+        thresholds.append(f"ликвидации ≥ {fmt_usd(liquidation_threshold_usd)}/час")
+    if thresholds:
+        lines.append("Алерты: " + " · ".join(thresholds))
+    if snapshot is not None and oi_windows:
+        longest_hours = max(m for m, _ in oi_windows) / 60
+        history_hours = history_seconds / 3600
+        if history_hours < longest_hours:
+            covered = f"{history_hours:.1f}".replace(".", ",") if history_hours < 10 else f"{history_hours:.0f}"
+            lines.append(f"<i>История открытого интереса: {covered} ч из {longest_hours:.0f} ч — длинные окна заработают позже.</i>")
+    lines.append(DISCLAIMER)
+    return "\n".join(lines)
 
 
 class TelegramNotifier:
