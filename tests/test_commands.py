@@ -40,7 +40,11 @@ def test_status_and_help(monitor):
     handler = handler_for(monitor)
     handler.handle_update({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/status@Tongramcheckerbot"}})
     assert monitor.notifier.sent_to[0][0] == "1"
-    assert "Состояние" in monitor.notifier.sent_to[0][1]
+    status = monitor.notifier.sent_to[0][1]
+    assert "Состояние" in status
+    assert "Первоисточники: @durov, @telegram" in status and "опрос каждые 60 с" in status
+    monitor.priority_poll_enabled = False
+    assert "без ускоренного опроса" in handler.handle_command("/status")
     assert "/mute" in handler.handle_command("/help")
     assert "Неизвестная" in handler.handle_command("/foo")
 

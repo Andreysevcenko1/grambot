@@ -164,17 +164,28 @@ class RSSSource:
         self.max_workers = max_workers
         self.last_results: List[FeedResult] = []
 
-    def fetch_all(self) -> List[FeedResult]:
-        if not self.feed_urls:
+    def fetch_all(self, urls: Optional[Sequence[str]] = None) -> List[FeedResult]:
+        """Fetch every configured feed, or only ``urls`` (a subset used by the
+        priority fast lane). Results for the fetched feeds replace the previous
+        ones in ``last_results`` so status output always shows the latest state."""
+        targets = list(urls) if urls is not None else self.feed_urls
+        if not targets:
             return []
-        workers = max(1, min(self.max_workers, len(self.feed_urls)))
+        workers = max(1, min(self.max_workers, len(targets)))
         with requests.Session() as session, concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fetch_feed, url, self.timeout, session): url for url in self.feed_urls}
+            futures = {pool.submit(fetch_feed, url, self.timeout, session): url for url in targets}
             results = [future.result() for future in futures]
         # Keep the configured order for status output.
         order = {url: idx for idx, url in enumerate(self.feed_urls)}
-        results.sort(key=lambda r: order.get(r.url, 0))
-        self.last_results = results
+        results.sort(key=lambda r: order.get(r.url, len(order)))
+        if urls is None:
+            self.last_results = results
+        else:
+            fresh = {r.url: r for r in results}
+            merged = [fresh.pop(r.url, r) for r in self.last_results]
+            merged.extend(fresh.values())
+            merged.sort(key=lambda r: order.get(r.url, len(order)))
+            self.last_results = merged
         return results
 
     def fetch(self) -> List[NewsItem]:

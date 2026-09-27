@@ -162,3 +162,102 @@ def test_run_once_and_prune(monitor):
         assert monitor.run_once() == 0
     monitor.maybe_prune()
     assert monitor.storage.get_float("last_prune_at") is not None
+
+
+def test_priority_source_neutral_post_is_sent_at_once(monitor):
+    # Default priority list includes @durov; the post has no sentiment words
+    # but mentions the ecosystem, so it is delivered without waiting for a
+    # second source, a price move or a lexicon hit.
+    monitor.source.queue(
+        [
+            make_item(
+                "Telegram Stars can now be converted to Toncoin directly in the app",
+                source="Du Rove's Channel",
+                url="https://t.me/durov/412",
+            )
+        ]
+    )
+    assert monitor.poll_news_once() == 1
+    message = monitor.notifier.sent[0]
+    assert "🔔 <b>Первоисточник: Du Rove&#x27;s Channel</b>" in message
+    assert "Влияние не оценено" in message
+    assert "Сила: не оценена" in message
+    assert "Источники: 1" in message
+    assert monitor.storage.count_signals_since(0) == 1
+
+
+def test_priority_source_post_off_topic_or_from_others_stays_neutral(monitor):
+    monitor.source.queue(
+        [
+            # Durov, but only about a Telegram feature: no priority keyword.
+            make_item("Telegram now lets you schedule voice chats", source="Du Rove's Channel", url="https://t.me/durov/413"),
+            # Ecosystem post, but from an ordinary trusted (not priority) source.
+            make_item("Toncoin mentioned in the Official Channel weekly digest", source="Official Channel"),
+        ]
+    )
+    assert monitor.poll_news_once() == 0
+    assert monitor.notifier.sent == []
+
+
+def test_priority_source_with_sentiment_uses_regular_header_and_skips_hourly_cap(monitor):
+    for i in range(3):  # fixture cap is 3 per hour
+        monitor.storage.record_signal("news", f"s{i}", None, "negative", "high", 2, price_at_send=1.0)
+    ok, why = monitor.can_notify()
+    assert not ok and "rate limit" in why
+    assert monitor.can_notify(priority=True) == (True, "")
+
+    monitor.source.queue(
+        [make_item("TON network outage: validators halted", source="TON Status", url="https://t.me/tonstatus/900")]
+    )
+    assert monitor.poll_news_once() == 1
+    message = monitor.notifier.sent[0]
+    assert message.startswith("🔔 <b>Первоисточник: TON Status</b>\n🔴 Возможное негативное влияние")
+    assert "Сила: не оценена" not in message
+
+    # /mute still wins over priority.
+    monitor.storage.set_value(MUTED_UNTIL_KEY, str(time.time() + 600))
+    assert monitor.can_notify(priority=True) == (False, "muted")
+    monitor.source.queue([make_item("TON mainnet halted again", source="TON Status", url="https://t.me/tonstatus/901")])
+    assert monitor.poll_news_once() == 0
+
+
+def test_priority_poll_fetches_only_priority_channels(monitor):
+    assert monitor.priority_poll_enabled
+    assert monitor._priority_feed_urls == [
+        feed for feed in monitor.settings.rss_feeds if any(f"/{c}" in feed.lower() for c in monitor._priority_channels)
+    ]
+    assert "https://t.me/s/durov" in monitor._priority_feed_urls
+    assert not any("whale" in url for url in monitor._priority_feed_urls)
+
+    monitor.source.queue([make_item("GRAM staking rewards are live in @wallet", source="Du Rove's Channel", url="https://t.me/durov/414")])
+    assert monitor.poll_priority_once() == 1
+    assert monitor.source.last_urls == monitor._priority_feed_urls
+    assert monitor.last_priority_poll_at is not None
+    assert monitor.last_news_poll_at is None  # the fast lane is not a full poll
+
+    # The full poll sees the same post again and must not repeat it.
+    monitor.source.queue([make_item("GRAM staking rewards are live in @wallet", source="Du Rove's Channel", url="https://t.me/durov/414")])
+    assert monitor.poll_news_once() == 0
+    assert len(monitor.notifier.sent) == 1
+
+    monitor.settings.priority_sources = []
+    monitor.source.last_urls = "untouched"
+    monitor._priority_feed_urls = []
+    assert monitor.poll_priority_once() == 0
+    assert monitor.source.last_urls == "untouched"
+
+
+def test_priority_source_post_is_relevant_via_priority_keywords_only(monitor):
+    # No TON/GRAM/Telegram keyword in the text: an ordinary source would be
+    # filtered out as irrelevant, the official channel is kept because of
+    # "Gifts"/"blockchain" and then sent without a sentiment reading.
+    title = "Gifts can now be turned into collectibles and moved to the blockchain"
+    monitor.source.queue(
+        [
+            make_item(title, source="Some Blog"),
+            make_item(title, source="Telegram News", url="https://t.me/telegram/500"),
+        ]
+    )
+    assert monitor.poll_news_once() == 1
+    assert monitor.storage.count_items_since(0) == 1
+    assert "🔔 <b>Первоисточник: Telegram News</b>" in monitor.notifier.sent[0]

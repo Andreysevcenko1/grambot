@@ -228,6 +228,7 @@ class CommandHandler(threading.Thread):
         lines.append(f"Сигналов за 24ч: {self.storage.count_signals_since(day_ago)}")
         lines.append(f"Классификатор: {html.escape(m.classifier_name)}")
         lines.append(f"Интервал: новости {self.settings.poll_interval_seconds // 60} мин, цена {self.settings.price_poll_interval_seconds // 60} мин")
+        lines.append(self._priority_status_line())
         lines.append(self._market_status_line())
         lines.append(self._onchain_status_line())
         lines.append(self._futures_status_line())
@@ -236,6 +237,22 @@ class CommandHandler(threading.Thread):
         if muted_until:
             lines.append(f"🔇 Уведомления на паузе до {fmt_time(muted_until)}")
         return "\n".join(lines)
+
+    def _priority_status_line(self) -> str:
+        m = self.monitor
+        names = ", ".join(html.escape(s) for s in self.settings.priority_sources[:6])
+        if len(self.settings.priority_sources) > 6:
+            names += "…"
+        if not self.settings.priority_sources:
+            return "Первоисточники: не заданы"
+        if m.priority_poll_enabled:
+            interval = self.settings.priority_poll_interval_seconds
+            cadence = f"опрос каждые {interval} с" if interval < 120 else f"опрос каждые {interval // 60} мин"
+            if m.last_priority_poll_at:
+                cadence += f", последний {fmt_time(m.last_priority_poll_at)}"
+        else:
+            cadence = "без ускоренного опроса"
+        return f"Первоисточники: {names} — {cadence}; их посты приходят сразу, даже без оценки"
 
     def _health_status_line(self) -> str:
         m = self.monitor

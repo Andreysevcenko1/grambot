@@ -33,7 +33,8 @@ from .onchain import Labels, MasterchainState, ScanResult, TonCenterClient, Tran
 from .price import PriceMove
 from .processing.classifier import Classifier, RuleBasedClassifier, meets_min_strength
 from .processing.clustering import find_matching_cluster, new_cluster_id
-from .processing.filters import filter_fresh, filter_relevant
+from .processing.filters import filter_fresh, is_relevant
+from .processing.keywords import matches_any
 from .processing.llm_classifier import LLMClassifier
 from .processing.whale_alert import is_transfer_post, is_whale_alert_item, parse_transfer
 from .sources import NewsItem
@@ -96,17 +97,15 @@ class GramTonMonitor:
         self._poll_requested = False
         self._poll_lock = threading.Lock()
         self._price_lock = threading.Lock()
-        self._trusted_names: List[str] = []
-        self._trusted_channels: set = set()
-        for entry in settings.trusted_sources:
-            entry = entry.strip()
-            if not entry:
-                continue
-            channel = channel_from_url(entry)
-            if channel:
-                self._trusted_channels.add(channel.lower())
-            else:
-                self._trusted_names.append(entry.lower())
+        self._trusted_names, self._trusted_channels = self._parse_source_list(settings.trusted_sources)
+        self._priority_names, self._priority_channels = self._parse_source_list(settings.priority_sources)
+        # Fast lane: priority Telegram channels re-polled between full polls.
+        self._priority_feed_urls: List[str] = [
+            feed for feed in settings.rss_feeds
+            if (channel_from_url(feed) or "").lower() in self._priority_channels
+        ]
+        self.priority_poll_enabled = bool(self._priority_feed_urls) and settings.priority_poll_interval_seconds > 0
+        self.last_priority_poll_at: Optional[float] = None
         self.price_client = price_module.PriceClient(
             coin_id=settings.coingecko_coin_id,
             symbol=settings.price_symbol,
@@ -187,63 +186,121 @@ class GramTonMonitor:
             return until
         return None
 
-    def can_notify(self) -> Tuple[bool, str]:
+    def can_notify(self, priority: bool = False) -> Tuple[bool, str]:
+        """Priority posts skip the hourly cap (a founder's post is the one
+        message worth receiving during a busy hour) but respect /mute."""
         if self.muted_until():
             return False, "muted"
+        if priority:
+            return True, ""
         sent_last_hour = self.storage.count_signals_since(time.time() - 3600)
         if sent_last_hour >= self.settings.max_notifications_per_hour:
             return False, f"rate limit ({sent_last_hour}/h)"
         return True, ""
 
-    def is_trusted_source(self, source: str, url: str = "") -> bool:
-        """``source`` is matched by name; Telegram posts also by channel username."""
+    @staticmethod
+    def _parse_source_list(entries: Sequence[str]) -> Tuple[List[str], set]:
+        """Split a source list into lowercase name fragments and Telegram channel usernames."""
+        names: List[str] = []
+        channels: set = set()
+        for entry in entries:
+            entry = entry.strip()
+            if not entry:
+                continue
+            channel = channel_from_url(entry)
+            if channel:
+                channels.add(channel.lower())
+            else:
+                names.append(entry.lower())
+        return names, channels
+
+    @staticmethod
+    def _source_matches(source: str, url: str, names: Sequence[str], channels: set) -> bool:
         name = source.lower()
-        if any(t in name for t in self._trusted_names):
+        if any(t in name for t in names):
             return True
         channel = channel_from_post_url(url) if url else None
-        return bool(channel) and channel.lower() in self._trusted_channels
+        return bool(channel) and channel.lower() in channels
+
+    def is_trusted_source(self, source: str, url: str = "") -> bool:
+        """``source`` is matched by name; Telegram posts also by channel username."""
+        return self._source_matches(source, url, self._trusted_names, self._trusted_channels)
+
+    def is_priority_source(self, source: str, url: str = "") -> bool:
+        """Founder/official channels whose posts are shown even without a sentiment reading."""
+        return self._source_matches(source, url, self._priority_names, self._priority_channels)
+
+    def _is_priority_item(self, item: NewsItem) -> bool:
+        """A priority-source post that mentions the ecosystem (``priority_keywords``)."""
+        return self.is_priority_source(item.source, item.url or "") and bool(
+            matches_any(item.text, self.settings.priority_keywords)
+        )
 
     # -- news ------------------------------------------------------------
     def poll_news_once(self) -> int:
+        """Full poll of every feed."""
         with self._poll_lock:
             results = self.source.fetch_all()
             self.last_feed_results = results
             self.last_news_poll_at = time.time()
-
-            items: List[NewsItem] = [item for r in results for item in r.items]
-            fresh = filter_fresh(items, self.settings.max_item_age_hours)
-            # Whale Alert transfer lines are data, not headlines: route them to
-            # the whale monitor and keep them out of clustering/verification.
-            transfer_posts = [item for item in fresh if is_whale_alert_item(item) and is_transfer_post(item)]
-            if transfer_posts:
-                skipped = {id(item) for item in transfer_posts}
-                fresh = [item for item in fresh if id(item) not in skipped]
-            relevant = filter_relevant(fresh, self.settings.keywords)
-            # Oldest first so corroboration and clustering follow the timeline.
-            relevant.sort(key=lambda i: i.published_at)
-
-            notified = 0
-            new_items = 0
-            for item in relevant:
-                if self.storage.has_seen(item.item_hash):
-                    continue
-                new_items += 1
-                try:
-                    if self._process_item(item):
-                        notified += 1
-                except Exception:  # pragma: no cover - one bad item must not stop the poll
-                    logger.exception("Failed to process item %r", item.title)
-
-            whale_transfers = self._ingest_whale_alert_posts(transfer_posts)
-
-            ok_feeds = sum(1 for r in results if r.ok)
-            logger.info(
-                "Poll done: feeds %d/%d ok, %d items, %d fresh, %d relevant, %d new, %d notified, %d whale transfer(s)",
-                ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified, len(whale_transfers),
-            )
+            notified, ok_feeds, whale_transfers = self._process_feed_results(results, "Poll")
         if results:
             first_error = next((r.error for r in results if not r.ok and r.error), None)
             self._report_health("feeds", ok_feeds > 0, first_error)
+        self._alert_whale_transfers(whale_transfers)
+        return notified
+
+    def poll_priority_once(self) -> int:
+        """Fast lane: only the priority Telegram channels, between full polls."""
+        if not self._priority_feed_urls:
+            return 0
+        with self._poll_lock:
+            results = self.source.fetch_all(self._priority_feed_urls)
+            self.last_feed_results = list(getattr(self.source, "last_results", None) or self.last_feed_results)
+            self.last_priority_poll_at = time.time()
+            notified, _ok, whale_transfers = self._process_feed_results(results, "Priority poll")
+        self._alert_whale_transfers(whale_transfers)
+        return notified
+
+    def _process_feed_results(self, results: Sequence[FeedResult], label: str) -> Tuple[int, int, List[Transfer]]:
+        """Filter, cluster, classify and notify; caller holds ``_poll_lock``."""
+        items: List[NewsItem] = [item for r in results for item in r.items]
+        fresh = filter_fresh(items, self.settings.max_item_age_hours)
+        # Whale Alert transfer lines are data, not headlines: route them to
+        # the whale monitor and keep them out of clustering/verification.
+        transfer_posts = [item for item in fresh if is_whale_alert_item(item) and is_transfer_post(item)]
+        if transfer_posts:
+            skipped = {id(item) for item in transfer_posts}
+            fresh = [item for item in fresh if id(item) not in skipped]
+        # Priority channels are also relevant when they touch the ecosystem
+        # without naming it ("Stars can now be cashed out to your wallet").
+        relevant = [item for item in fresh if is_relevant(item, self.settings.keywords) or self._is_priority_item(item)]
+        # Oldest first so corroboration and clustering follow the timeline.
+        relevant.sort(key=lambda i: i.published_at)
+
+        notified = 0
+        new_items = 0
+        for item in relevant:
+            if self.storage.has_seen(item.item_hash):
+                continue
+            new_items += 1
+            try:
+                if self._process_item(item):
+                    notified += 1
+            except Exception:  # pragma: no cover - one bad item must not stop the poll
+                logger.exception("Failed to process item %r", item.title)
+
+        whale_transfers = self._ingest_whale_alert_posts(transfer_posts)
+
+        ok_feeds = sum(1 for r in results if r.ok)
+        log = logger.info if label == "Poll" or new_items else logger.debug
+        log(
+            "%s done: feeds %d/%d ok, %d items, %d fresh, %d relevant, %d new, %d notified, %d whale transfer(s)",
+            label, ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified, len(whale_transfers),
+        )
+        return notified, ok_feeds, whale_transfers
+
+    def _alert_whale_transfers(self, whale_transfers: Sequence[Transfer]) -> None:
         for transfer in whale_transfers:
             if transfer.amount_ton < self.settings.whale_min_ton or transfer.kind not in onchain_module.ALERT_KINDS:
                 continue
@@ -252,7 +309,6 @@ class GramTonMonitor:
                 logger.info("Whale Alert transfer %.0f TON is %.0f min old; recorded without alert", transfer.amount_ton, (time.time() - transfer.utime) / 60)
                 continue
             self._safe(self._maybe_whale_alert, transfer)
-        return notified
 
     def _ingest_whale_alert_posts(self, posts: Sequence[NewsItem]) -> List[Transfer]:
         """Record new TON/GRAM transfers reported by Whale Alert; returns them oldest first."""
@@ -298,7 +354,8 @@ class GramTonMonitor:
             return False
 
         sources = self.storage.cluster_sources(cluster_id)
-        trusted = self.is_trusted_source(item.source, item.url or "") or any(
+        priority = self.is_priority_source(item.source, item.url or "")
+        trusted = priority or self.is_trusted_source(item.source, item.url or "") or any(
             self.is_trusted_source(s) for s in sources
         )
         verified = trusted or len(sources) >= self.settings.min_sources_for_verified
@@ -313,13 +370,18 @@ class GramTonMonitor:
 
         classification = self.classifier.classify(item.text)
         if classification.sentiment == "neutral":
-            logger.info("Neutral: %r [%s]", item.title, item.source)
-            return False
-        if not meets_min_strength(classification.strength, self.settings.min_notify_strength):
+            # A founder/official post about the ecosystem is shown even when the
+            # lexicon finds nothing to grade ("Stars can now be converted to Toncoin").
+            priority_hits = matches_any(item.text, self.settings.priority_keywords) if priority else []
+            if not priority_hits:
+                logger.info("Neutral: %r [%s]", item.title, item.source)
+                return False
+            logger.info("Priority post without sentiment reading (%s): %r [%s]", ", ".join(priority_hits), item.title, item.source)
+        elif not priority and not meets_min_strength(classification.strength, self.settings.min_notify_strength):
             logger.info("Below strength threshold (%s): %r", classification.strength, item.title)
             return False
 
-        allowed, why = self.can_notify()
+        allowed, why = self.can_notify(priority=priority)
         if not allowed:
             logger.info("Suppressed (%s): %r", why, item.title)
             return False
@@ -333,6 +395,7 @@ class GramTonMonitor:
             verified=verified,
             price_move=move,
             market_confirmed=market_confirmed,
+            priority=priority,
         )
         if not self.notifier.send(message):
             logger.warning("Telegram send failed for %r", item.title)
@@ -352,9 +415,10 @@ class GramTonMonitor:
             cluster_id=cluster_id,
         )
         logger.info(
-            "Notified: %r (sentiment=%s strength=%s sources=%d%s)",
+            "Notified: %r (sentiment=%s strength=%s sources=%d%s%s)",
             item.title, classification.sentiment, classification.strength, len(sources),
             " market-confirmed" if market_confirmed else "",
+            " priority" if priority else "",
         )
         return True
 
@@ -1023,9 +1087,12 @@ class GramTonMonitor:
     def run_forever(self) -> int:
         self._install_signal_handlers()
         logger.info(
-            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss, price every %ss, on-chain %s, futures %s",
+            "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss (%s), price every %ss, on-chain %s, futures %s",
             len(self.settings.rss_feeds), self.classifier_name,
-            self.settings.poll_interval_seconds, self.settings.price_poll_interval_seconds,
+            self.settings.poll_interval_seconds,
+            f"{len(self._priority_feed_urls)} priority channel(s) every {self.settings.priority_poll_interval_seconds}s"
+            if self.priority_poll_enabled else "no priority fast lane",
+            self.settings.price_poll_interval_seconds,
             f"every {self.settings.onchain_poll_interval_seconds}s" if self.onchain_enabled else "disabled",
             f"every {self.settings.futures_poll_interval_seconds}s" if self.futures_enabled else "disabled",
         )
@@ -1037,6 +1104,7 @@ class GramTonMonitor:
 
         now = time.monotonic()
         next_news = now
+        next_priority = float("inf")  # armed after the first full poll
         next_price = now
         next_onchain = now if self.onchain_enabled else float("inf")
         next_futures = now if self.futures_enabled else float("inf")
@@ -1055,6 +1123,12 @@ class GramTonMonitor:
                     self._poll_requested = False
                     self._safe(self.poll_news_once)
                     next_news = time.monotonic() + self.settings.poll_interval_seconds
+                    if self.priority_poll_enabled:
+                        # The full poll just covered the priority channels too.
+                        next_priority = time.monotonic() + self.settings.priority_poll_interval_seconds
+                elif now >= next_priority:
+                    self._safe(self.poll_priority_once)
+                    next_priority = time.monotonic() + self.settings.priority_poll_interval_seconds
                 if now >= next_onchain:
                     result = self._safe(self.poll_onchain)
                     # Hit the page cap without errors: keep catching up quickly.
@@ -1068,7 +1142,7 @@ class GramTonMonitor:
                 self._safe(self.maybe_prune)
                 self.beat()
 
-                timeout = max(1.0, min(next_news, next_price, next_onchain, next_futures, next_handler_check) - time.monotonic())
+                timeout = max(1.0, min(next_news, next_priority, next_price, next_onchain, next_futures, next_handler_check) - time.monotonic())
                 self.wake_event.wait(timeout)
                 self.wake_event.clear()
         finally:
