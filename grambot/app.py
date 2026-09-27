@@ -33,6 +33,7 @@ from .processing.filters import filter_fresh, filter_relevant
 from .processing.llm_classifier import LLMClassifier
 from .sources import NewsItem
 from .sources.rss import FeedResult, RSSSource
+from .sources.telegram_web import channel_from_post_url, channel_from_url
 from .storage import SeenItem, Storage
 from .supervisor import Supervisor, is_child_process, restart_info
 
@@ -82,7 +83,17 @@ class GramTonMonitor:
         self._poll_requested = False
         self._poll_lock = threading.Lock()
         self._price_lock = threading.Lock()
-        self._trusted = [s.lower() for s in settings.trusted_sources if s.strip()]
+        self._trusted_names: List[str] = []
+        self._trusted_channels: set = set()
+        for entry in settings.trusted_sources:
+            entry = entry.strip()
+            if not entry:
+                continue
+            channel = channel_from_url(entry)
+            if channel:
+                self._trusted_channels.add(channel.lower())
+            else:
+                self._trusted_names.append(entry.lower())
         self.price_client = price_module.PriceClient(
             coin_id=settings.coingecko_coin_id,
             symbol=settings.price_symbol,
@@ -159,9 +170,13 @@ class GramTonMonitor:
             return False, f"rate limit ({sent_last_hour}/h)"
         return True, ""
 
-    def is_trusted_source(self, source: str) -> bool:
+    def is_trusted_source(self, source: str, url: str = "") -> bool:
+        """``source`` is matched by name; Telegram posts also by channel username."""
         name = source.lower()
-        return any(t in name for t in self._trusted)
+        if any(t in name for t in self._trusted_names):
+            return True
+        channel = channel_from_post_url(url) if url else None
+        return bool(channel) and channel.lower() in self._trusted_channels
 
     # -- news ------------------------------------------------------------
     def poll_news_once(self) -> int:
@@ -215,7 +230,9 @@ class GramTonMonitor:
             return False
 
         sources = self.storage.cluster_sources(cluster_id)
-        trusted = any(self.is_trusted_source(s) for s in sources)
+        trusted = self.is_trusted_source(item.source, item.url or "") or any(
+            self.is_trusted_source(s) for s in sources
+        )
         verified = trusted or len(sources) >= self.settings.min_sources_for_verified
         market_confirmed = False
         if not verified and self._market_can_confirm(item):

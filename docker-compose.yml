@@ -20,9 +20,10 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Optional: your own RSSHub instance for Telegram channels (and X, Reddit…).
+  # Optional: your own RSSHub instance for X/Twitter and Reddit (Telegram
+  # channels are read directly from t.me and do not need it).
   # Start with:  docker compose --profile rsshub up -d
-  # Then point RSS_FEEDS at http://rsshub:1200/telegram/channel/<name>
+  # Then point RSS_FEEDS at http://rsshub:1200/twitter/user/<name> etc.
   rsshub:
     image: diygod/rsshub:latest
     container_name: grambot-rsshub

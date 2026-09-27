@@ -101,13 +101,15 @@ DEFAULT_RSS_FEEDS = [
     "https://decrypt.co/feed",
     "https://cryptoslate.com/feed/",
     "https://www.theblock.co/rss.xml",
-    # Telegram channels via a public RSSHub instance. Public bridges can be
-    # rate-limited or go offline; self-host RSSHub (see README) for
-    # reliability and replace the base URL below with your own instance.
-    "https://rsshub.rssforever.com/telegram/channel/tonblockchain",
-    "https://rsshub.rssforever.com/telegram/channel/tonstatus",
-    "https://rsshub.rssforever.com/telegram/channel/durov",
-    "https://rsshub.rssforever.com/telegram/channel/telegram",
+    # Official Telegram channels, read directly from the public web preview
+    # (https://t.me/s/<channel>) - no RSS bridge needed. Any public channel
+    # with previews enabled can be added the same way (or as "@name").
+    "https://t.me/s/tonblockchain",       # The Open Network
+    "https://t.me/s/toncoin",             # Gram of TON (official Toncoin -> Gram channel)
+    "https://t.me/s/tonstatus",           # TON Status (network incidents, validator votes)
+    "https://t.me/s/durov",               # Pavel Durov
+    "https://t.me/s/telegram",            # Telegram News
+    "https://t.me/s/binance_announcements",  # listings / delistings / trading changes
     # Official node releases (network upgrades). Not trusted for alerts on
     # their own: changelog wording ("fixed crash") confuses sentiment.
     "https://github.com/ton-blockchain/ton/releases.atom",
@@ -123,14 +125,19 @@ DEFAULT_KEYWORDS = [
     "Durov",
 ]
 
-# Items whose source name contains one of these (case-insensitive) are treated
-# as first-party/official and count as verified on their own, without waiting
-# for a second outlet to corroborate them.
+# First-party/official sources: an item from one of them counts as verified
+# on its own, without waiting for a second outlet to corroborate it.
+# Entries are either a substring of the source name (case-insensitive) or a
+# Telegram channel username ("@name" / "t.me/name"), which keeps working even
+# if the channel is renamed.
 DEFAULT_TRUSTED_SOURCES = [
-    "The Open Network - Telegram Channel",
-    "TON Status - Telegram Channel",
-    "Pavel Durov - Telegram Channel",
-    "Telegram News - Telegram Channel",
+    "@tonblockchain",
+    "@toncoin",
+    "@gram",  # @toncoin posts carry the channel's current username
+    "@tonstatus",
+    "@durov",
+    "@telegram",
+    "@binance_announcements",
 ]
 
 
