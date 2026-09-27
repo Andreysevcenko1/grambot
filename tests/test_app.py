@@ -48,6 +48,24 @@ def test_trusted_source_bypasses_corroboration(monitor):
     assert "Источники: 1" in monitor.notifier.sent[0]
 
 
+def test_trusted_telegram_channel_matches_by_username(monitor):
+    monitor._trusted_channels = {"tonstatus"}
+    monitor._trusted_names = []
+    assert monitor.is_trusted_source("Whatever Title - Telegram Channel", "https://t.me/tonstatus/241")
+    assert not monitor.is_trusted_source("TON Status - Telegram Channel", "https://t.me/impostor/1")
+    assert not monitor.is_trusted_source("TON Status - Telegram Channel")
+    monitor.source.queue(
+        [
+            make_item(
+                "Network outage: TON validators halted",
+                source="TON Status - Telegram Channel",
+                url="https://t.me/tonstatus/241",
+            )
+        ]
+    )
+    assert monitor.poll_news_once() == 1
+
+
 def test_neutral_and_irrelevant_items_are_ignored(monitor):
     monitor.source.queue(
         [

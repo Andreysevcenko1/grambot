@@ -22,7 +22,7 @@ TON: $1,405 · −4,2% за 20 мин · −6,1% за 24ч
 ## Как это работает
 
 ```
-RSS / Google News / Telegram-каналы (через RSSHub)
+RSS / Google News / Telegram-каналы (веб-превью t.me/s/<канал>, без RSSHub)
         │  параллельная загрузка, таймауты, издатель как источник
         ▼
 Фильтр свежести (≤ 24ч) → фильтр ключевых слов (TON, GRAM, Telegram… по границам слов)
@@ -131,7 +131,7 @@ Mac должен быть включён и не спать (Настройки 
 docker compose up -d --build      # бот
 docker compose logs -f grambot    # логи
 docker compose ps                 # колонка STATUS: healthy / unhealthy
-docker compose --profile rsshub up -d   # + собственный RSSHub для Telegram-каналов
+docker compose --profile rsshub up -d   # + свой RSSHub, если нужны X/Twitter или Reddit
 ```
 
 `docker-compose.yml` уже содержит `restart: unless-stopped`, ротацию логов,
@@ -139,8 +139,9 @@ docker compose --profile rsshub up -d   # + собственный RSSHub для
 пояс задаётся переменной `TZ` (по умолчанию `Europe/Riga`). Обновление:
 `git pull && docker compose up -d --build`.
 
-При своём RSSHub укажите в `.env`
-`RSS_FEEDS=...,http://rsshub:1200/telegram/channel/tonblockchain,...`.
+Telegram-каналы читаются напрямую, RSSHub для них не нужен. Свой RSSHub
+пригодится только для X/Twitter и Reddit: добавьте в `.env`
+`RSS_FEEDS=...,http://rsshub:1200/twitter/user/<name>,...`.
 
 ### Вариант C — VPS без Docker (systemd, например Google Cloud VM)
 
@@ -211,7 +212,7 @@ journalctl -u grambot -f
 |---|---|
 | Google News RSS (запрос TON/Toncoin/GRAM/The Open Network) | сотни изданий; каждое считается отдельным источником |
 | Cointelegraph, Decrypt, CryptoSlate, The Block | профильные крипто-СМИ |
-| Telegram-каналы `tonblockchain`, `tonstatus`, `durov`, `telegram` через RSSHub | официальные объявления; считаются подтверждёнными сразу (`TRUSTED_SOURCES`) |
+| Telegram-каналы `@tonblockchain`, `@toncoin` (Gram of TON), `@tonstatus`, `@durov`, `@telegram`, `@binance_announcements` — напрямую с `https://t.me/s/<канал>` | официальные объявления, инциденты сети, листинги/делистинги; считаются подтверждёнными сразу (`TRUSTED_SOURCES`), в бот попадают в течение одного опроса (`POLL_INTERVAL_SECONDS`) |
 | GitHub `ton-blockchain/ton` (releases.atom) | обновления сети; попадают в `/recent`, сами по себе сигнал не дают |
 | TON Center API v3 (`toncenter.com`) + метки адресов `ton-studio/ton-labels` | ончейн: крупные переводы, потоки на/с бирж, состояние сети |
 
@@ -221,10 +222,15 @@ journalctl -u grambot -f
 но r/toncoin неактивен, а посты в основном рекламные, поэтому добавляйте по
 желанию через `RSS_FEEDS`. Ликвидации на деривативах не отслеживаются.
 
-Публичный RSSHub (`rsshub.rssforever.com`) может отваливаться — для надёжности
-поднимите свой (`--profile rsshub`). Через RSSHub так же подключаются X/Twitter
-и Reddit (`/twitter/user/<name>`, `/reddit/subreddit/<name>`), если инстанс
-настроен с нужными ключами.
+**Telegram-каналы.** Любой публичный канал с включённым веб-превью можно
+добавить в `RSS_FEEDS` как `https://t.me/s/<канал>` или просто `@<канал>` — бот
+разбирает страницу превью сам (то же, что делает RSSHub, но без Node.js и
+лишних 300 МБ памяти). Источник называется `<Название канала> - Telegram
+Channel`, ссылка ведёт на пост. В `TRUSTED_SOURCES` канал лучше указывать как
+`@<канал>` — тогда переименование канала ничего не сломает. Приватные каналы,
+каналы без превью и посты без текста (только медиа) не читаются. RSSHub
+остаётся полезен для X/Twitter и Reddit (`/twitter/user/<name>`,
+`/reddit/subreddit/<name>`), если инстанс настроен с нужными ключами.
 
 ## Ончейн: крупные переводы и состояние сети
 

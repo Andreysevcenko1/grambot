@@ -126,6 +126,14 @@ def parse_feed(content: bytes, feed_url: str, fetched_at: Optional[float] = None
 
 
 def fetch_feed(feed_url: str, timeout: float = 15.0, session: Optional[requests.Session] = None) -> FeedResult:
+    # Telegram channels (``https://t.me/s/<name>``, ``@name``) are scraped from
+    # the public web preview instead of going through an RSS bridge.
+    from .telegram_web import channel_from_url, fetch_channel  # local import: avoids a cycle
+
+    channel = channel_from_url(feed_url)
+    if channel:
+        return fetch_channel(channel, feed_url, timeout=timeout, session=session)
+
     started = time.time()
     http = session or requests
     try:
