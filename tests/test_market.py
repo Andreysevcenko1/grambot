@@ -13,7 +13,14 @@ from grambot import market
 from grambot import price as price_module
 from grambot.commands import CommandHandler
 from grambot.config import Settings, parse_windows
-from grambot.notifier import fmt_times, fmt_window, format_price_alert, format_price_context, format_volume_alert
+from grambot.notifier import (
+    fmt_times,
+    fmt_window,
+    format_impulse_alert,
+    format_price_alert,
+    format_price_context,
+    format_volume_alert,
+)
 from grambot.storage import Storage
 
 from .conftest import make_item
@@ -36,7 +43,8 @@ def test_settings_combine_fast_window_with_slow_ones(monkeypatch):
     assert settings.volume_spike_ratio == 1.5
 
     defaults = Settings()
-    assert defaults.all_price_windows == [(20, 5.0), (60, 3.5), (240, 6.0), (1440, 10.0)]
+    assert defaults.all_price_windows == [(20, 4.0), (60, 2.5), (240, 5.0), (1440, 8.0)]
+    assert defaults.enable_impulse_alerts and (defaults.impulse_fast_pct, defaults.impulse_slow_pct) == (2.0, 1.5)
     assert 60 in Settings(price_alert_windows=[]).price_window_lengths
 
 
@@ -405,10 +413,114 @@ def test_price_and_status_commands_show_market_details(monitor):
 
     monitor.volume_client.last_stats = stats
     status = handler.handle_command("/status")
-    assert "Алерты цены: 5,0%/20 мин · 3,5%/1 ч · 6,0%/4 ч · 10,0%/24 ч; объём ×4 (okx)" in status
+    assert "Алерты цены: 5,0%/20 мин · 2,5%/1 ч · 5,0%/4 ч · 8,0%/24 ч; импульс 2,0%/20 мин при 1,5%/1 ч; объём ×4 (okx)" in status
 
     monitor.volume_client.last_stats = None
     monitor.volume_client.last_error = "bybit: HTTP 451"
     assert "объём недоступен — bybit: HTTP 451" in handler.handle_command("/status")
     monitor.settings.enable_volume_alerts = False
     assert "объём выключен" in handler.handle_command("/status")
+
+
+# -- early warning (impulse) ---------------------------------------------------------
+def test_impulse_rule_needs_fast_move_confirmed_by_the_hour():
+    move = price_module.PriceMove(1.0, 20, None, None, 0.0, None, window_changes={20: 2.1, 60: 1.9})
+    assert market.impulse(move, 20, 2.0, 1.5) == (2.1, 1.9)
+    move.window_changes[60] = 1.2  # hour has not confirmed yet
+    assert market.impulse(move, 20, 2.0, 1.5) is None
+    assert market.impulse(move, 20, 2.0, 0.0) == (2.1, 1.2)  # confirmation disabled
+    move.window_changes[60] = -1.8  # a bounce inside a falling hour is not an impulse
+    assert market.impulse(move, 20, 2.0, 1.5) is None
+    move.window_changes.update({20: -2.4, 60: -1.8})
+    assert market.impulse(move, 20, 2.0, 1.5) == (-2.4, -1.8)
+    move.window_changes[20] = None
+    assert market.impulse(move, 20, 2.0, 1.5) is None
+
+
+def test_impulse_alert_text():
+    move = price_module.PriceMove(1.614, 20, 1.9, 9.8, 1.0, None, window_changes={20: 1.9, 60: 1.6, 240: -0.5, 1440: 9.8})
+    text = format_impulse_alert(move, 20)
+    assert text.startswith("⚡ Импульс TON: +1,9% за 20 мин")
+    assert "+1,9% за 20 мин · +1,6% за 1 ч · −0,5% за 4 ч" in text
+    assert "Раннее предупреждение" in text and "Если рост продолжится, придёт обычный сигнал." in text
+    assert "не финансовая рекомендация" in text
+    move.window_changes[20] = -2.2
+    assert "Если падение продолжится" in format_impulse_alert(move, 20)
+
+
+def test_impulse_warns_early_and_the_regular_alert_still_follows(monitor):
+    """Replay of 27.09: +2.1%/20 min at 15:20 UTC, +3.3%/1 h at 15:45."""
+    t0 = time.time() - 3600
+    monitor.storage.add_price_point(1.590, 1000.0, fetched_at=t0 - 40 * 60)  # 14:20
+    monitor.storage.add_price_point(1.588, 1000.0, fetched_at=t0)  # 15:00
+    monitor.storage.add_price_point(1.587, 1000.0, fetched_at=t0 + 5 * 60)
+    monitor.storage.add_price_point(1.608, 1000.0, fetched_at=t0 + 10 * 60)
+    monitor.storage.add_price_point(1.614, 1000.0, fetched_at=t0 + 15 * 60)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(1.621, t0 + 20 * 60)):
+        monitor.poll_price()  # 15:20 — +2.1% in 20 min, +2.1% over the hour
+    assert len(monitor.notifier.sent) == 1
+    assert monitor.notifier.sent[0].startswith("⚡ Импульс TON: +2,1% за 20 мин")
+    assert monitor.market_active_until() is None  # weak evidence: does not confirm single-source news
+    signal = monitor.storage.recent_signals(1)[0]
+    assert signal.kind == "impulse" and signal.sentiment == "positive" and signal.strength == "low"
+
+    monitor.storage.add_price_point(1.608, 1000.0, fetched_at=t0 + 25 * 60)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(1.624, t0 + 35 * 60)):
+        monitor.poll_price()  # +0.6% in 20 min: the impulse rule re-arms and stays quiet
+    assert len(monitor.notifier.sent) == 1
+
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(1.640, t0 + 45 * 60)):
+        monitor.poll_price()  # 15:45 — +3.3% over the hour crosses the 2.5% window
+    assert len(monitor.notifier.sent) == 2
+    assert monitor.notifier.sent[1].startswith("📈 Рост TON: +3,3% за 1 ч")  # the impulse did not eat the cooldown
+    assert monitor.market_active_until() > t0
+
+    # Another +2% leg right after the regular alert adds nothing new.
+    monitor.storage.set_value(app_module.IMPULSE_FIRED_KEY, None)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(1.674, t0 + 60 * 60)):
+        monitor.poll_price()  # +3.0%/20 min, +5.4%/1 h: window fired, impulse inside the price-alert cooldown
+    assert len(monitor.notifier.sent) == 2
+
+
+def test_impulse_cooldown_rearm_and_switch(monitor):
+    now = time.time()
+    monitor.storage.add_price_point(2.00, 1000.0, fetched_at=now - 60 * 60)
+    monitor.storage.add_price_point(2.00, 1000.0, fetched_at=now - 20 * 60)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(2.045, now)):
+        monitor.poll_price()
+    assert len(monitor.notifier.sent) == 1 and monitor.notifier.sent[0].startswith("⚡")
+
+    monitor.storage.set_value(app_module.LAST_IMPULSE_ALERT_KEY, str(now - 7200))  # cooldown over, still fired
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(2.046, now + 120)):
+        monitor.poll_price()
+    assert len(monitor.notifier.sent) == 1
+    monitor.storage.add_price_point(2.046, 1000.0, fetched_at=now + 120)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(2.047, now + 22 * 60)):
+        monitor.poll_price()  # +0.05% in 20 min: re-arms
+    assert monitor.storage.get_value(app_module.IMPULSE_FIRED_KEY) is None
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(2.09, now + 24 * 60)):
+        monitor.poll_price()  # fresh +2.1% leg, hour +4.5%: the regular alert wins, no second impulse
+    assert len(monitor.notifier.sent) == 2 and monitor.notifier.sent[1].startswith("📈 Рост TON")
+
+    monitor.settings.enable_impulse_alerts = False
+    monitor.storage.set_value(app_module.LAST_PRICE_ALERT_KEY, str(now - 7200))
+    for minutes in (20, 60, 240, 1440):
+        monitor.storage.set_value(app_module.PRICE_WINDOW_FIRED_KEY.format(minutes=minutes), None)
+    monitor.storage.add_price_point(2.00, 1000.0, fetched_at=now + 40 * 60)
+    monitor.storage.add_price_point(2.00, 1000.0, fetched_at=now + 80 * 60)
+    with patch.object(price_module.PriceClient, "fetch", return_value=snapshot(2.045, now + 100 * 60)):
+        monitor.poll_price()
+    assert len(monitor.notifier.sent) == 2  # disabled: +2.25%/20 min alone is not a price alert
+
+
+def test_stats_count_impulses_and_their_follow_through(monitor):
+    now = time.time()
+    monitor.storage.record_signal("impulse", "Импульс TON +2.10%", None, "positive", "low", 0, 1.60, sent_at=now - 7200)
+    monitor.storage.record_signal("impulse", "Импульс TON -2.30%", None, "negative", "low", 0, 1.60, sent_at=now - 7000)
+    monitor.storage.record_signal("impulse", "Импульс TON +2.00%", None, "positive", "low", 0, 1.60, sent_at=now - 60)
+    monitor.storage.add_price_point(1.65, 1000.0, fetched_at=now - 3600)  # an hour after the first two
+    assert monitor.update_signal_followups() == 2
+    stats = monitor.storage.signal_stats()
+    assert (stats.total_impulse, stats.impulse_evaluated, stats.impulse_continued) == (3, 2, 1)
+    text = CommandHandler(monitor, monitor.notifier).handle_command("/stats")
+    assert "Импульсов (ранних предупреждений): 3, продолжились через 1ч: 1 из 2" in text

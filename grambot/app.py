@@ -21,6 +21,7 @@ from .health import HealthEvent, HealthTracker, Watchdog, format_health_event, h
 from .notifier import (
     TelegramNotifier,
     format_futures_alert,
+    format_impulse_alert,
     format_network_alert,
     format_news_alert,
     format_price_alert,
@@ -45,9 +46,11 @@ logger = logging.getLogger(__name__)
 
 LAST_PRICE_ALERT_KEY = "last_price_alert_at"
 LAST_VOLUME_ALERT_KEY = "last_volume_alert_at"
+LAST_IMPULSE_ALERT_KEY = "last_impulse_alert_at"
 MARKET_ACTIVE_UNTIL_KEY = "market_active_until"
 PRICE_WINDOW_FIRED_KEY = "price_window_fired_{minutes}"  # set while a window waits to re-arm
 VOLUME_FIRED_KEY = "volume_alert_fired"
+IMPULSE_FIRED_KEY = "impulse_alert_fired"
 LAST_PRUNE_KEY = "last_prune_at"
 ONCHAIN_LAST_UTIME_KEY = "onchain_last_utime"
 LAST_WHALE_ALERT_KEY = "last_whale_alert_at"
@@ -442,42 +445,65 @@ class GramTonMonitor:
             if self.storage.get_value(VOLUME_FIRED_KEY) is not None:
                 self.storage.set_value(VOLUME_FIRED_KEY, None)
                 logger.info("Volume alert re-armed (ratio %.2f)", ratio)
+        fast = move.window_changes.get(self.settings.price_window_minutes)
+        if fast is not None and abs(fast) < self.settings.impulse_fast_pct / 2:
+            if self.storage.get_value(IMPULSE_FIRED_KEY) is not None:
+                self.storage.set_value(IMPULSE_FIRED_KEY, None)
+                logger.info("Impulse alert re-armed (%.2f%%)", fast)
 
     def _maybe_market_alert(self, move: PriceMove, send: bool = True) -> bool:
-        """Multi-window price alerts plus volume-burst alerts, with hysteresis.
+        """Multi-window price alerts, volume-burst alerts and the early-warning
+        impulse, with hysteresis.
 
         Every window that crosses its threshold marks the market as active (so
         single-source news can be confirmed) even when the alert itself is held
         back by a cooldown or ``send`` is False; a window alerts once and
-        re-arms after its change drops below half the threshold.
+        re-arms after its change drops below half the threshold. The impulse is
+        weaker evidence: it neither activates the market nor shares the price
+        alert cooldown, so the regular alert still follows if the move goes on.
         """
         self._rearm_windows(move)
         now = time.time()
-        hits = market_module.triggered_windows(move, self.settings.all_price_windows)
-        volume_spike = self.settings.enable_volume_alerts and market_module.is_volume_spike(
-            move, self.settings.volume_spike_ratio, self.settings.volume_spike_min_move_pct
+        s = self.settings
+        hits = market_module.triggered_windows(move, s.all_price_windows)
+        volume_spike = s.enable_volume_alerts and market_module.is_volume_spike(
+            move, s.volume_spike_ratio, s.volume_spike_min_move_pct
         )
-        if not hits and not volume_spike:
+        impulse = (
+            market_module.impulse(move, s.price_window_minutes, s.impulse_fast_pct, s.impulse_slow_pct)
+            if s.enable_impulse_alerts
+            else None
+        )
+        if not hits and not volume_spike and impulse is None:
             return False
-        self._mark_market_active()
+        if hits or volume_spike:
+            self._mark_market_active()
         if not send:
             return False
 
         armed_hits = [h for h in hits if not self._window_fired(h[0])]
         volume_armed = volume_spike and self.storage.get_value(VOLUME_FIRED_KEY) is None
         sent = False
+        last_price_alert = self.storage.get_float(LAST_PRICE_ALERT_KEY) or 0.0
         if armed_hits:
-            last = self.storage.get_float(LAST_PRICE_ALERT_KEY) or 0.0
-            if now - last < self.settings.price_alert_cooldown_minutes * 60:
+            if now - last_price_alert < s.price_alert_cooldown_minutes * 60:
                 logger.info("Price move %s within cooldown; not alerting", _describe_hits(armed_hits))
             else:
                 sent = self._send_price_alert(move, hits, armed_hits)
         if volume_spike and not sent and volume_armed:
             last = self.storage.get_float(LAST_VOLUME_ALERT_KEY) or 0.0
-            if now - last < self.settings.volume_alert_cooldown_minutes * 60:
+            if now - last < s.volume_alert_cooldown_minutes * 60:
                 logger.info("Volume spike x%.1f within cooldown; not alerting", move.volume_1h_ratio or 0.0)
             else:
                 sent = self._send_volume_alert(move)
+        if impulse is not None and not sent and self.storage.get_value(IMPULSE_FIRED_KEY) is None:
+            cooldown = s.impulse_cooldown_minutes * 60
+            last_impulse = self.storage.get_float(LAST_IMPULSE_ALERT_KEY) or 0.0
+            # A regular price alert in the last hour already covered this move.
+            if now - last_impulse < cooldown or now - last_price_alert < cooldown:
+                logger.info("Impulse %+.2f%% within cooldown; not alerting", impulse[0])
+            else:
+                sent = self._send_impulse_alert(move, impulse)
         return sent
 
     def _send_price_alert(
@@ -535,6 +561,31 @@ class GramTonMonitor:
             price_at_send=move.price_usd,
         )
         logger.info("Volume alert sent: x%.1f, 1h %+.2f%% (causes: %d)", move.volume_1h_ratio or 0.0, change_1h, len(causes))
+        return True
+
+    def _send_impulse_alert(self, move: PriceMove, impulse: Tuple[float, float]) -> bool:
+        allowed, why = self.can_notify()
+        if not allowed:
+            logger.info("Impulse alert suppressed (%s)", why)
+            return False
+        fast, slow = impulse
+        minutes = self.settings.price_window_minutes
+        causes = self.recent_causes()
+        if not self.notifier.send(format_impulse_alert(move, minutes, causes)):
+            return False
+        now = time.time()
+        self.storage.set_value(LAST_IMPULSE_ALERT_KEY, str(now))
+        self.storage.set_value(IMPULSE_FIRED_KEY, "1")
+        self.storage.record_signal(
+            kind="impulse",
+            title=f"Импульс TON {fast:+.2f}% за {minutes} мин ({slow:+.2f}% за час)",
+            url=None,
+            sentiment="positive" if fast > 0 else "negative",
+            strength="high" if abs(fast) >= 2 * self.settings.impulse_fast_pct else "low",
+            source_count=len(causes),
+            price_at_send=move.price_usd,
+        )
+        logger.info("Impulse alert sent: %+.2f%%/%dm, 1h %+.2f%% (causes: %d)", fast, minutes, slow, len(causes))
         return True
 
     # Backwards-compatible name used by older callers/tests.
