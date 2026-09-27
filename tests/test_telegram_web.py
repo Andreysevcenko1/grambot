@@ -133,6 +133,8 @@ def test_default_feeds_include_official_channels_without_rsshub():
     telegram_feeds = [url for url in DEFAULT_RSS_FEEDS if channel_from_url(url)]
     assert {channel_from_url(url) for url in telegram_feeds} >= {"tonblockchain", "tonstatus", "durov", "telegram"}
     assert not any("rsshub" in url for url in DEFAULT_RSS_FEEDS)
-    # Every default channel is trusted by username, so renames do not break verification.
+    # Every official default channel is trusted by username, so renames do not
+    # break verification. Whale Alert is a data feed, not a first-party source.
     trusted = {channel_from_url(entry) for entry in DEFAULT_TRUSTED_SOURCES}
-    assert {channel_from_url(url) for url in telegram_feeds} <= trusted
+    assert {channel_from_url(url) for url in telegram_feeds} - {"whale_alert_io"} <= trusted
+    assert "whale_alert_io" not in trusted

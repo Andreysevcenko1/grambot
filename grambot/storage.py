@@ -68,9 +68,20 @@ CREATE TABLE IF NOT EXISTS onchain_transfers (
     source_label TEXT,
     destination_label TEXT,
     kind TEXT NOT NULL,
-    notified INTEGER NOT NULL DEFAULT 0
+    notified INTEGER NOT NULL DEFAULT 0,
+    link TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_onchain_utime ON onchain_transfers(utime);
+
+CREATE TABLE IF NOT EXISTS futures_history (
+    fetched_at REAL NOT NULL,
+    provider TEXT NOT NULL,
+    open_interest REAL,
+    open_interest_usd REAL,
+    funding_rate REAL,
+    mark_price REAL
+);
+CREATE INDEX IF NOT EXISTS idx_futures_history_fetched ON futures_history(fetched_at);
 
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
@@ -83,6 +94,7 @@ CREATE TABLE IF NOT EXISTS kv (
 MIGRATIONS = [
     ("price_history", "change_24h_pct", "ALTER TABLE price_history ADD COLUMN change_24h_pct REAL"),
     ("price_history", "provider", "ALTER TABLE price_history ADD COLUMN provider TEXT"),
+    ("onchain_transfers", "link", "ALTER TABLE onchain_transfers ADD COLUMN link TEXT"),
 ]
 
 
@@ -135,6 +147,7 @@ class SignalStats:
     total_news: int = 0
     total_price: int = 0
     total_onchain: int = 0
+    total_futures: int = 0
     evaluated_1h: int = 0
     hits_1h: int = 0
     avg_abs_move_1h: Optional[float] = None
@@ -154,6 +167,21 @@ class TransferRecord:
     destination_label: Optional[str]
     kind: str
     notified: bool
+    link: Optional[str] = None  # off-chain report (e.g. a Whale Alert post) instead of a tx
+
+    @property
+    def url(self) -> str:
+        return self.link or f"https://tonviewer.com/transaction/{self.hash}"
+
+
+@dataclass
+class FuturesPoint:
+    fetched_at: float
+    provider: str
+    open_interest: Optional[float]
+    open_interest_usd: Optional[float]
+    funding_rate: Optional[float]
+    mark_price: Optional[float]
 
 
 @dataclass
@@ -196,6 +224,17 @@ def _row_to_price(row: sqlite3.Row) -> PricePoint:
         volume_usd=row["volume_usd"],
         change_24h_pct=row["change_24h_pct"],
         provider=row["provider"],
+    )
+
+
+def _row_to_futures(row: sqlite3.Row) -> FuturesPoint:
+    return FuturesPoint(
+        fetched_at=row["fetched_at"],
+        provider=row["provider"],
+        open_interest=row["open_interest"],
+        open_interest_usd=row["open_interest_usd"],
+        funding_rate=row["funding_rate"],
+        mark_price=row["mark_price"],
     )
 
 
@@ -474,6 +513,8 @@ class Storage:
         stats.total_price = int(row["c"]) if row else 0
         row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'onchain'")
         stats.total_onchain = int(row["c"]) if row else 0
+        row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'futures'")
+        stats.total_futures = int(row["c"]) if row else 0
         rows = self._query(
             "SELECT sentiment, price_at_send, price_after_1h, price_after_24h FROM signals WHERE kind = 'news'"
         )
@@ -513,16 +554,17 @@ class Storage:
         source_label: Optional[str],
         destination_label: Optional[str],
         kind: str,
+        link: Optional[str] = None,
     ) -> bool:
         """Insert a transfer; returns False when the hash was already known."""
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO onchain_transfers
-                    (hash, utime, source, destination, amount_ton, source_label, destination_label, kind)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (hash, utime, source, destination, amount_ton, source_label, destination_label, kind, link)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (hash, utime, source, destination, amount_ton, source_label, destination_label, kind),
+                (hash, utime, source, destination, amount_ton, source_label, destination_label, kind, link),
             )
             return cur.rowcount > 0
 
@@ -549,9 +591,57 @@ class Storage:
                 destination_label=r["destination_label"],
                 kind=r["kind"],
                 notified=bool(r["notified"]),
+                link=r["link"],
             )
             for r in rows
         ]
+
+    # -- futures (open interest / funding) history ---------------------------
+    def add_futures_point(
+        self,
+        provider: str,
+        open_interest: Optional[float],
+        open_interest_usd: Optional[float],
+        funding_rate: Optional[float],
+        mark_price: Optional[float],
+        fetched_at: Optional[float] = None,
+    ) -> None:
+        self._execute(
+            """
+            INSERT INTO futures_history (fetched_at, provider, open_interest, open_interest_usd, funding_rate, mark_price)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (fetched_at if fetched_at is not None else time.time(), provider, open_interest, open_interest_usd, funding_rate, mark_price),
+        )
+
+    def futures_point_at_or_before(self, ts: float, provider: str) -> Optional[FuturesPoint]:
+        row = self._query_one(
+            """
+            SELECT * FROM futures_history WHERE fetched_at <= ? AND provider = ?
+            ORDER BY fetched_at DESC LIMIT 1
+            """,
+            (ts, provider),
+        )
+        return _row_to_futures(row) if row else None
+
+    def futures_point_near(self, ts: float, tolerance_seconds: float, provider: str) -> Optional[FuturesPoint]:
+        row = self._query_one(
+            """
+            SELECT * FROM futures_history WHERE fetched_at BETWEEN ? AND ? AND provider = ?
+            ORDER BY ABS(fetched_at - ?) ASC LIMIT 1
+            """,
+            (ts - tolerance_seconds, ts + tolerance_seconds, provider, ts),
+        )
+        return _row_to_futures(row) if row else None
+
+    def futures_history_span(self, provider: str) -> float:
+        """Seconds covered by stored points of ``provider`` (0 when fewer than two)."""
+        row = self._query_one(
+            "SELECT MIN(fetched_at) AS lo, MAX(fetched_at) AS hi FROM futures_history WHERE provider = ?", (provider,)
+        )
+        if not row or row["lo"] is None or row["hi"] is None:
+            return 0.0
+        return float(row["hi"] - row["lo"])
 
     def flow_stats(self, since_ts: float) -> FlowStats:
         stats = FlowStats()
@@ -603,6 +693,7 @@ class Storage:
             deleted += self._conn.execute("DELETE FROM clusters WHERE last_seen_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM price_history WHERE fetched_at < ?", (cutoff,)).rowcount
             deleted += self._conn.execute("DELETE FROM onchain_transfers WHERE utime < ?", (cutoff,)).rowcount
+            deleted += self._conn.execute("DELETE FROM futures_history WHERE fetched_at < ?", (cutoff,)).rowcount
         with self._lock:
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

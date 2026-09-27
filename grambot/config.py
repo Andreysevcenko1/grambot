@@ -83,10 +83,10 @@ def parse_windows(raw: str) -> List[Tuple[int, float]]:
             minutes = int(minutes_text.strip())
             threshold = float(threshold_text.strip().replace(",", "."))
         except ValueError:
-            logger.warning("Ignoring invalid price window %r (expected MINUTES:PERCENT)", entry)
+            logger.warning("Ignoring invalid window %r (expected MINUTES:PERCENT)", entry)
             continue
         if minutes <= 0 or threshold <= 0:
-            logger.warning("Ignoring non-positive price window %r", entry)
+            logger.warning("Ignoring non-positive window %r", entry)
             continue
         windows[minutes] = threshold
     return sorted(windows.items())
@@ -110,10 +110,15 @@ DEFAULT_RSS_FEEDS = [
     "https://t.me/s/durov",               # Pavel Durov
     "https://t.me/s/telegram",            # Telegram News
     "https://t.me/s/binance_announcements",  # listings / delistings / trading changes
+    # Whale Alert: large TON/GRAM transfers between exchanges and wallets.
+    # Transfer posts feed the whale monitor (/whales), not the news pipeline.
+    "https://t.me/s/whale_alert_io",
     # Official node releases (network upgrades). Not trusted for alerts on
     # their own: changelog wording ("fixed crash") confuses sentiment.
     "https://github.com/ton-blockchain/ton/releases.atom",
 ]
+
+DEFAULT_OI_ALERT_WINDOWS = "60:4,240:6,1440:10"
 
 DEFAULT_KEYWORDS = [
     "TON",
@@ -148,7 +153,7 @@ class Settings:
     rss_feeds: List[str] = field(default_factory=lambda: list(DEFAULT_RSS_FEEDS))
     keywords: List[str] = field(default_factory=lambda: list(DEFAULT_KEYWORDS))
     trusted_sources: List[str] = field(default_factory=lambda: list(DEFAULT_TRUSTED_SOURCES))
-    poll_interval_seconds: int = 300
+    poll_interval_seconds: int = 180
     price_poll_interval_seconds: int = 120
     feed_timeout_seconds: int = 15
     max_item_age_hours: int = 24
@@ -171,6 +176,15 @@ class Settings:
     market_confirms_news: bool = True  # a single-source item passes verification during a market move
     market_active_minutes: int = 180
     market_confirmed_news_limit: int = 3  # max single-source items confirmed per active period
+    # Perpetual futures: funding rate, open interest, liquidations (informational).
+    enable_futures_alerts: bool = True
+    futures_poll_interval_seconds: int = 300
+    funding_alert_daily_pct: float = 0.15  # |funding| per day; ~0.1%/day is the 95th percentile for GRAM
+    oi_alert_windows: List[Tuple[int, float]] = field(
+        default_factory=lambda: parse_windows(DEFAULT_OI_ALERT_WINDOWS)
+    )
+    liquidation_alert_usd: float = 250_000.0  # liquidated over the trailing hour (OKX public data)
+    futures_alert_cooldown_minutes: int = 180
     retention_days: int = 30
     enable_commands: bool = True
     send_startup_message: bool = True
@@ -219,7 +233,7 @@ class Settings:
             rss_feeds=_env_list("RSS_FEEDS", DEFAULT_RSS_FEEDS),
             keywords=_env_list("KEYWORDS", DEFAULT_KEYWORDS),
             trusted_sources=_env_list("TRUSTED_SOURCES", DEFAULT_TRUSTED_SOURCES),
-            poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 300)),
+            poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 180)),
             price_poll_interval_seconds=max(30, _env_int("PRICE_POLL_INTERVAL_SECONDS", 120)),
             feed_timeout_seconds=max(3, _env_int("FEED_TIMEOUT_SECONDS", 15)),
             max_item_age_hours=max(1, _env_int("MAX_ITEM_AGE_HOURS", 24)),
@@ -239,6 +253,12 @@ class Settings:
             market_confirms_news=_env_bool("MARKET_CONFIRMS_NEWS", True),
             market_active_minutes=max(1, _env_int("MARKET_ACTIVE_MINUTES", 180)),
             market_confirmed_news_limit=max(0, _env_int("MARKET_CONFIRMED_NEWS_LIMIT", 3)),
+            enable_futures_alerts=_env_bool("ENABLE_FUTURES_ALERTS", True),
+            futures_poll_interval_seconds=max(60, _env_int("FUTURES_POLL_INTERVAL_SECONDS", 300)),
+            funding_alert_daily_pct=max(0.0, _env_float("FUNDING_ALERT_DAILY_PCT", 0.15)),
+            oi_alert_windows=parse_windows(os.getenv("OI_ALERT_WINDOWS", DEFAULT_OI_ALERT_WINDOWS)),
+            liquidation_alert_usd=max(0.0, _env_float("LIQUIDATION_ALERT_USD", 250_000.0)),
+            futures_alert_cooldown_minutes=max(0, _env_int("FUTURES_ALERT_COOLDOWN_MINUTES", 180)),
             retention_days=max(1, _env_int("RETENTION_DAYS", 30)),
             enable_commands=_env_bool("ENABLE_COMMANDS", True),
             send_startup_message=_env_bool("SEND_STARTUP_MESSAGE", True),

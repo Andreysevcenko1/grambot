@@ -125,5 +125,10 @@ def test_whales_command_empty_and_with_data(monitor):
     assert "Ончейн: отставание" in handler.handle_command("/status")
 
     monitor.onchain_enabled = False
+    # Whale Alert (in the default feeds) keeps /whales useful without TON Center.
+    text = handler.handle_command("/whales")
+    assert "Крупные переводы за 24ч" in text and "Whale Alert" in text and "h1" in text
+    assert "Ончейн: выключен · крупные переводы — по данным Whale Alert" in handler.handle_command("/status")
+    monitor.whale_alert_enabled = False
     assert "выключен" in handler.handle_command("/whales")
     assert "Ончейн: выключен" in handler.handle_command("/status")

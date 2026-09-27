@@ -15,14 +15,17 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from .notifier import (
     DISCLAIMER,
     TelegramNotifier,
+    fmt_amount_usd,
     fmt_pct,
     fmt_time,
     fmt_ton,
     fmt_usd,
     fmt_window,
+    format_futures_status,
     format_news_alert,
     format_price_context,
 )
+from .derivatives import base_asset
 from .health import COMPONENT_TITLES, current_rss_mb
 from .onchain import KIND_LABELS
 from .processing.classifier import Classification
@@ -54,7 +57,8 @@ def describe_sender(message: Dict[str, Any]) -> str:
 COMMANDS = [
     ("status", "Состояние бота"),
     ("price", "Цена TON и движение"),
-    ("whales", "Крупные ончейн-переводы за 24ч"),
+    ("whales", "Крупные переводы за 24ч"),
+    ("futures", "Фьючерсы: финансирование, OI, ликвидации"),
     ("recent", "Последние релевантные новости"),
     ("stats", "Статистика сигналов"),
     ("feeds", "Состояние источников"),
@@ -74,6 +78,7 @@ HELP_TEXT = "\n".join(
         "/status — состояние бота",
         "/price — цена TON, изменение и объём",
         "/whales [N] — крупные переводы и потоки бирж за 24ч",
+        "/futures — бессрочные фьючерсы: ставка финансирования, открытый интерес, ликвидации",
         "/recent [N] — последние релевантные новости",
         "/stats — как сигналы соотносились с ценой",
         "/feeds — какие источники работают",
@@ -191,6 +196,7 @@ class CommandHandler(threading.Thread):
             "/status": self.cmd_status,
             "/price": self.cmd_price,
             "/whales": self.cmd_whales,
+            "/futures": self.cmd_futures,
             "/recent": self.cmd_recent,
             "/stats": self.cmd_stats,
             "/feeds": self.cmd_feeds,
@@ -224,6 +230,7 @@ class CommandHandler(threading.Thread):
         lines.append(f"Интервал: новости {self.settings.poll_interval_seconds // 60} мин, цена {self.settings.price_poll_interval_seconds // 60} мин")
         lines.append(self._market_status_line())
         lines.append(self._onchain_status_line())
+        lines.append(self._futures_status_line())
         lines.append(self._health_status_line())
         muted_until = m.muted_until()
         if muted_until:
@@ -283,6 +290,8 @@ class CommandHandler(threading.Thread):
     def _onchain_status_line(self) -> str:
         info = self.monitor.onchain_status()
         if not info["enabled"]:
+            if self.monitor.whale_alert_enabled:
+                return "Ончейн: выключен · крупные переводы — по данным Whale Alert"
             return "Ончейн: выключен"
         if info["backoff_seconds"] > 0:
             return f"Ончейн: лимит TON Center, пауза {info['backoff_seconds'] / 60:.0f} мин"
@@ -296,25 +305,67 @@ class CommandHandler(threading.Thread):
         parts.append(f"меток адресов: {info['labels']}")
         return " · ".join(parts)
 
+    def _futures_status_line(self) -> str:
+        info = self.monitor.futures_status()
+        if not info["enabled"]:
+            return "Деривативы: выключены"
+        snapshot = info["snapshot"]
+        if snapshot is None:
+            if info["error"]:
+                return f"Деривативы: недоступны — {html.escape(str(info['error'])[:60])}"
+            return "Деривативы: ожидают первого опроса"
+        parts = [f"Деривативы ({html.escape(snapshot.provider)}):"]
+        if snapshot.funding_daily_pct is not None:
+            parts.append(f"финансирование {fmt_pct(snapshot.funding_daily_pct, 2)}/день")
+        if snapshot.open_interest_usd:
+            parts.append(f"OI {fmt_usd(snapshot.open_interest_usd)}")
+        liquidations = info["liquidations"]
+        if liquidations is not None:
+            parts.append(f"ликвидации {fmt_amount_usd(liquidations.total_usd)}/ч")
+        elif info["liquidations_error"]:
+            parts.append("ликвидации недоступны")
+        return parts[0] + " " + " · ".join(parts[1:])
+
+    def cmd_futures(self, args: List[str]) -> str:
+        m = self.monitor
+        if not m.futures_enabled:
+            return "Мониторинг деривативов выключен (ENABLE_FUTURES_ALERTS=false)."
+        m.poll_futures(alert=False)
+        info = m.futures_status()
+        return format_futures_status(
+            info["snapshot"],
+            info["liquidations"],
+            asset=base_asset(self.settings.price_symbol),
+            funding_threshold_daily_pct=self.settings.funding_alert_daily_pct,
+            oi_windows=self.settings.oi_alert_windows,
+            liquidation_threshold_usd=self.settings.liquidation_alert_usd,
+            history_seconds=info["history_seconds"],
+            error=info["error"],
+            move=m.current_price_move() if info["snapshot"] is not None else None,
+        )
+
     def cmd_whales(self, args: List[str]) -> str:
-        if not self.monitor.onchain_enabled:
-            return "Ончейн-мониторинг выключен (ENABLE_ONCHAIN=false)."
+        m = self.monitor
+        if not m.onchain_enabled and not m.whale_alert_enabled:
+            return "Ончейн-мониторинг выключен (ENABLE_ONCHAIN=false), канал Whale Alert не подключён."
         limit = 5
         if args and args[0].isdigit():
             limit = max(1, min(15, int(args[0])))
         day_ago = time.time() - 86400
         flows = self.storage.flow_stats(day_ago)
         transfers = self.storage.recent_transfers(day_ago, limit=limit)
-        move = self.monitor.current_price_move()
+        move = m.current_price_move()
         price = move.price_usd if move else None
 
         def usd(amount_ton: float) -> str:
             return f" (≈ {fmt_usd(amount_ton * price)})" if price else ""
 
-        threshold = self.settings.whale_min_ton / 10.0
+        threshold = self.settings.whale_min_ton / 10.0 if m.onchain_enabled else None
+        title = "🐋 <b>Ончейн за 24ч</b>" if m.onchain_enabled else "🐋 <b>Крупные переводы за 24ч</b>"
+        counted = f"Переводов ≥ {fmt_ton(threshold)}" if threshold else "Переводов"
         lines = [
-            "🐋 <b>Ончейн за 24ч</b>",
-            f"Переводов ≥ {fmt_ton(threshold)}: {flows.total_count} на {fmt_ton(flows.total_ton)}{usd(flows.total_ton)}",
+            title,
+            f"{counted}: {flows.total_count} на {fmt_ton(flows.total_ton)}{usd(flows.total_ton)}",
             f"На биржи: {fmt_ton(flows.deposits_ton)} ({flows.deposits_count}) · с бирж: {fmt_ton(flows.withdrawals_ton)} ({flows.withdrawals_count})",
         ]
         if flows.deposits_count or flows.withdrawals_count:
@@ -329,15 +380,20 @@ class CommandHandler(threading.Thread):
                 dst = html.escape(t.destination_label or "неизвестный")
                 mark = " 🔔" if t.notified else ""
                 lines.append(
-                    f'• <a href="https://tonviewer.com/transaction/{html.escape(t.hash, quote=True)}">{fmt_ton(t.amount_ton)}</a>'
+                    f'• <a href="{html.escape(t.url, quote=True)}">{fmt_ton(t.amount_ton)}</a>'
                     f" {src} → {dst}\n  <i>{KIND_LABELS.get(t.kind, t.kind)} · {fmt_time(t.utime)}</i>{mark}"
                 )
         else:
             lines.append("")
             lines.append("Крупных переводов за сутки пока не зафиксировано.")
-        info = self.monitor.onchain_status()
-        if info["lag_seconds"] is not None:
-            lines.append(f"<i>Данные TON Center, отставание {_fmt_duration(info['lag_seconds'])}; метки адресов: ton-labels.</i>")
+        sources = []
+        info = m.onchain_status()
+        if m.onchain_enabled and info["lag_seconds"] is not None:
+            sources.append(f"TON Center, отставание {_fmt_duration(info['lag_seconds'])}; метки адресов: ton-labels")
+        if m.whale_alert_enabled:
+            sources.append("Whale Alert (@whale_alert_io)")
+        if sources:
+            lines.append(f"<i>Данные: {'; '.join(sources)}.</i>")
         lines.append(DISCLAIMER)
         return "\n".join(lines)
 
@@ -363,6 +419,7 @@ class CommandHandler(threading.Thread):
             f"Новостных сигналов: {s.total_news}",
             f"Ценовых алертов: {s.total_price}",
             f"Ончейн-сигналов: {s.total_onchain}",
+            f"Сигналов по деривативам: {s.total_futures}",
         ]
 
         def block(label: str, evaluated: int, hits: int, avg: Optional[float]) -> str:
