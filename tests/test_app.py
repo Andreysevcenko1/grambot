@@ -104,7 +104,7 @@ def test_failed_send_does_not_mark_cluster_notified(monitor):
 
 def test_price_alert_with_cooldown(monitor):
     now = time.time()
-    monitor.storage.add_price_point(2.0, 1000.0, fetched_at=now - 30 * 60)
+    monitor.storage.add_price_point(2.0, 1000.0, fetched_at=now - 25 * 60)
     snap = price_module.PriceSnapshot(price_usd=2.2, volume_24h_usd=1500.0, change_24h_pct=8.0, fetched_at=now)
     with patch.object(price_module.PriceClient, "fetch", return_value=snap):
         move = monitor.poll_price()
@@ -119,7 +119,7 @@ def test_price_alert_with_cooldown(monitor):
 
 def test_news_alert_includes_fresh_price_context(monitor):
     now = time.time()
-    monitor.storage.add_price_point(2.0, 1000.0, fetched_at=now - 30 * 60)
+    monitor.storage.add_price_point(2.0, 1000.0, fetched_at=now - 25 * 60)
     monitor.storage.add_price_point(1.9, 1200.0, change_24h_pct=-3.0, fetched_at=now - 10)
     monitor.source.queue([make_item("Binance delists TON", source="A"), make_item("Binance delists TON", source="B")])
     with patch.object(price_module.PriceClient, "fetch") as fetch:

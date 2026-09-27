@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -46,13 +46,21 @@ class PriceSnapshot:
 class PriceMove:
     price_usd: float
     window_minutes: int
-    window_change_pct: Optional[float]  # change over the configured window from local history
+    window_change_pct: Optional[float]  # change over the fast window from local history
     change_24h_pct: Optional[float]  # 24h change reported by the provider
     volume_24h_usd: float
     volume_ratio_vs_yesterday: Optional[float]  # today's 24h volume / 24h volume a day ago
     provider: str = "coingecko"
     local_currency: str = "USD"  # display currency (DISPLAY_CURRENCY); history stays in USD
     local_price: Optional[float] = None  # price converted to ``local_currency`` when it is not USD
+    # Changes over every configured window (minutes -> pct); includes the fast window.
+    window_changes: Dict[int, Optional[float]] = field(default_factory=dict)
+    volume_1h_usd: Optional[float] = None  # traded value over the trailing hour (exchange klines)
+    volume_1h_ratio: Optional[float] = None  # vs the median hourly value of the previous day
+    volume_provider: Optional[str] = None
+
+    def change_over(self, minutes: int) -> Optional[float]:
+        return self.window_changes.get(minutes)
 
 
 class RateLimited(Exception):
@@ -319,11 +327,40 @@ def pct_change(current: float, previous: Optional[float]) -> Optional[float]:
     return (current - previous) / previous * 100.0
 
 
-def compute_move(storage: Storage, snapshot: PriceSnapshot, window_minutes: int) -> PriceMove:
-    """Combine the live snapshot with local history into a ``PriceMove``."""
-    window_start = snapshot.fetched_at - window_minutes * 60
-    earlier: Optional[PricePoint] = storage.price_at_or_before(window_start)
-    window_change = pct_change(snapshot.price_usd, earlier.price_usd) if earlier else None
+def _reference_point(storage: Storage, ts: float, window_seconds: float) -> Optional[PricePoint]:
+    """Stored point representing the price at ``ts``.
+
+    Prefers the latest point at or before ``ts``; after downtime that point may
+    be far older than the window (which would report a 10-hour change as a
+    20-minute one), so anything outside the tolerance (a quarter of the window,
+    at least 5 minutes) is ignored and the nearest point on either side is used
+    instead, if any.
+    """
+    tolerance = max(window_seconds * 0.25, 300.0) + 60.0
+    point = storage.price_at_or_before(ts)
+    if point is not None and ts - point.fetched_at <= tolerance:
+        return point
+    return storage.price_near(ts, tolerance)
+
+
+def compute_move(
+    storage: Storage,
+    snapshot: PriceSnapshot,
+    window_minutes: int,
+    extra_windows: Iterable[int] = (),
+) -> PriceMove:
+    """Combine the live snapshot with local history into a ``PriceMove``.
+
+    ``window_minutes`` is the fast window (``window_change_pct``); changes for
+    it and every window in ``extra_windows`` are also stored in
+    ``window_changes``.
+    """
+    changes: Dict[int, Optional[float]] = {}
+    for minutes in sorted({window_minutes, *extra_windows}):
+        if minutes <= 0:
+            continue
+        earlier = _reference_point(storage, snapshot.fetched_at - minutes * 60, minutes * 60)
+        changes[minutes] = pct_change(snapshot.price_usd, earlier.price_usd) if earlier else None
 
     day_ago = storage.price_near(snapshot.fetched_at - 86400, tolerance_seconds=3 * 3600)
     volume_ratio = None
@@ -338,17 +375,18 @@ def compute_move(storage: Storage, snapshot: PriceSnapshot, window_minutes: int)
     return PriceMove(
         price_usd=snapshot.price_usd,
         window_minutes=window_minutes,
-        window_change_pct=window_change,
+        window_change_pct=changes.get(window_minutes),
         change_24h_pct=snapshot.change_24h_pct,
         volume_24h_usd=snapshot.volume_24h_usd,
         volume_ratio_vs_yesterday=volume_ratio,
         provider=snapshot.provider,
         local_currency=snapshot.local_currency or "USD",
         local_price=snapshot.local_price,
+        window_changes=changes,
     )
 
 
-def move_from_history(storage: Storage, window_minutes: int) -> Optional[PriceMove]:
+def move_from_history(storage: Storage, window_minutes: int, extra_windows: Iterable[int] = ()) -> Optional[PriceMove]:
     """Build a ``PriceMove`` purely from stored data (no network call)."""
     latest = storage.latest_price()
     if latest is None:
@@ -360,7 +398,7 @@ def move_from_history(storage: Storage, window_minutes: int) -> Optional[PriceMo
         fetched_at=latest.fetched_at,
         provider=latest.provider or "coingecko",
     )
-    return compute_move(storage, snapshot, window_minutes)
+    return compute_move(storage, snapshot, window_minutes, extra_windows)
 
 
 def is_spike(move: PriceMove, threshold_pct: float) -> bool:
