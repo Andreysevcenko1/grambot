@@ -81,6 +81,25 @@ def fmt_ratio(value: Optional[float]) -> str:
     return f"×{value:.1f}".replace(".", ",")
 
 
+def fmt_times(value: float) -> str:
+    """Multiplier for prose: ``в 4,2 раза``, ``в 3 раза``, ``в 5 раз``."""
+    if abs(value - round(value)) < 0.05:
+        n = int(round(value))
+        word = "раза" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "раз"
+        return f"в {n} {word}"
+    return f"в {value:.1f} раза".replace(".", ",")
+
+
+def fmt_window(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} мин"
+    if minutes % 1440 == 0 and minutes > 1440:
+        return f"{minutes // 1440} д"
+    if minutes % 60 == 0:
+        return f"{minutes // 60} ч"
+    return f"{minutes / 60:.1f} ч".replace(".", ",")
+
+
 def fmt_time(ts: float) -> str:
     return time.strftime("%d.%m %H:%M", time.localtime(ts))
 
@@ -91,20 +110,59 @@ def truncate(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _window_line(move: PriceMove) -> Optional[str]:
+    """``−1,2% за 20 мин · +3,6% за 1 ч · +6,1% за 4 ч`` (24h is shown on the headline line)."""
+    parts = []
+    for minutes in sorted(move.window_changes):
+        change = move.window_changes[minutes]
+        if change is None or (minutes == 1440 and move.change_24h_pct is not None):
+            continue
+        parts.append(f"{fmt_pct(change)} за {fmt_window(minutes)}")
+    if not parts and move.window_change_pct is not None:
+        parts.append(f"{fmt_pct(move.window_change_pct)} за {fmt_window(move.window_minutes)}")
+    return " · ".join(parts) if parts else None
+
+
 def format_price_context(move: Optional[PriceMove]) -> List[str]:
     if move is None:
         return []
-    parts = [f"TON: {fmt_price_move(move)}"]
-    if move.window_change_pct is not None:
-        parts.append(f"{fmt_pct(move.window_change_pct)} за {move.window_minutes} мин")
-    if move.change_24h_pct is not None:
-        parts.append(f"{fmt_pct(move.change_24h_pct)} за 24ч")
-    lines = [" · ".join(parts)]
+    change_24h = move.change_24h_pct if move.change_24h_pct is not None else move.window_changes.get(1440)
+    head = f"TON: {fmt_price_move(move)}"
+    if change_24h is not None:
+        head += f" · {fmt_pct(change_24h)} за 24ч"
+    lines = [head]
+    windows = _window_line(move)
+    if windows:
+        lines.append(windows)
     if move.volume_24h_usd:
         volume = f"Объём 24ч: {fmt_usd(move.volume_24h_usd)}"
         if move.volume_ratio_vs_yesterday is not None:
             volume += f" ({fmt_ratio(move.volume_ratio_vs_yesterday)} к вчера)"
         lines.append(volume)
+    if move.volume_1h_usd is not None:
+        hourly = f"Объём за час: {fmt_usd(move.volume_1h_usd)}"
+        if move.volume_1h_ratio is not None:
+            hourly += f" — {fmt_times(move.volume_1h_ratio)} выше обычного" if move.volume_1h_ratio >= 1.5 else (
+                f" ({fmt_ratio(move.volume_1h_ratio)} к обычному)"
+            )
+        lines.append(hourly)
+    return lines
+
+
+def format_causes(causes: Sequence[Any], limit: int = 2) -> List[str]:
+    """Recent relevant headlines that may explain a market move.
+
+    ``causes`` are ``storage.SeenItem``-like objects (title, url, source,
+    published_at). Single-source items are labelled as unconfirmed.
+    """
+    if not causes:
+        return ["Новостей, объясняющих движение, пока не найдено — проверьте источники."]
+    lines = ["Возможная причина (не подтверждено):"]
+    for cause in list(causes)[:limit]:
+        title = html.escape(truncate(cause.title, 120))
+        if getattr(cause, "url", None):
+            title = f'<a href="{html.escape(cause.url, quote=True)}">{title}</a>'
+        lines.append(f"• {title} — {html.escape(cause.source)}, {fmt_time(cause.published_at)}")
     return lines
 
 
@@ -115,6 +173,7 @@ def format_news_alert(
     sources: Sequence[str] = (),
     verified: bool = True,
     price_move: Optional[PriceMove] = None,
+    market_confirmed: bool = False,
 ) -> str:
     header = SENTIMENT_HEADERS.get(classification.sentiment, SENTIMENT_HEADERS["unknown"])
     strength = STRENGTH_LABELS.get(classification.strength, classification.strength)
@@ -127,7 +186,9 @@ def format_news_alert(
         if len(sources) > 4:
             names += "…"
         source_line += f" ({names})"
-    if not verified:
+    if market_confirmed:
+        source_line += " · совпадает с движением рынка"
+    elif not verified:
         source_line += " — не подтверждено"
     lines.append(source_line)
     if classification.reason:
@@ -148,16 +209,41 @@ def format_news_alert(
     return truncate("\n".join(lines))
 
 
-def format_price_alert(move: PriceMove) -> str:
-    change = move.window_change_pct or 0.0
+def format_price_alert(
+    move: PriceMove,
+    window_minutes: Optional[int] = None,
+    causes: Sequence[Any] = (),
+) -> str:
+    """Alert for a price move over ``window_minutes`` (default: the fast window)."""
+    minutes = window_minutes or move.window_minutes
+    change = move.window_changes.get(minutes)
+    if change is None:
+        change = move.window_change_pct or 0.0
     emoji = "📈" if change > 0 else "📉"
-    direction = "Резкий рост" if change > 0 else "Резкое падение"
-    lines = [
-        f"{emoji} {direction} TON: {fmt_pct(change)} за {move.window_minutes} мин",
-        "",
-    ]
+    if minutes < 60:
+        direction = "Резкий рост" if change > 0 else "Резкое падение"
+    else:
+        direction = "Рост" if change > 0 else "Падение"
+    lines = [f"{emoji} {direction} TON: {fmt_pct(change)} за {fmt_window(minutes)}", ""]
     lines.extend(format_price_context(move))
-    lines.extend(["", "Новостей, объясняющих движение, пока не найдено — проверьте источники.", DISCLAIMER])
+    lines.append("")
+    lines.extend(format_causes(causes))
+    lines.append(DISCLAIMER)
+    return truncate("\n".join(lines))
+
+
+def format_volume_alert(move: PriceMove, causes: Sequence[Any] = ()) -> str:
+    """Alert for a trading-volume burst that is not (yet) a price alert."""
+    ratio = move.volume_1h_ratio or 0.0
+    change_1h = move.window_changes.get(60)
+    head = f"📊 Всплеск объёма TON: {fmt_times(ratio)} выше обычного за час"
+    if change_1h is not None:
+        head += f" ({fmt_pct(change_1h)} за 1 ч)"
+    lines = [head, ""]
+    lines.extend(format_price_context(move))
+    lines.append("")
+    lines.extend(format_causes(causes))
+    lines.append(DISCLAIMER)
     return truncate("\n".join(lines))
 
 

@@ -470,7 +470,7 @@ class Storage:
 
     def signal_stats(self) -> SignalStats:
         stats = SignalStats()
-        row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'price'")
+        row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind IN ('price', 'volume')")
         stats.total_price = int(row["c"]) if row else 0
         row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'onchain'")
         stats.total_onchain = int(row["c"]) if row else 0

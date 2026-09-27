@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from grambot import market as market_module
 from grambot import onchain as onchain_module
 from grambot import price as price_module
 from grambot.app import GramTonMonitor
@@ -98,10 +99,12 @@ def monitor():
         source = FakeSource()
         notifier = FakeNotifier()
         mon = GramTonMonitor(settings, storage, source, RuleBasedClassifier(), notifier, classifier_name="test")
-        # Never hit the network from tests: price providers return nothing
-        # unless a test patches them itself; fiat rates are fixed; TON Center
-        # calls fail fast and the labels dataset is never refreshed.
+        # Never hit the network from tests: price/volume providers return
+        # nothing unless a test patches them itself; fiat rates are fixed; TON
+        # Center calls fail fast and the labels dataset is never refreshed.
         with patch.object(price_module.PriceClient, "fetch", return_value=None), patch.object(
+            market_module.VolumeClient, "fetch", return_value=None
+        ), patch.object(
             price_module.FiatRates, "get", side_effect=lambda cur: 1.0 if cur == "USD" else 0.9
         ), patch.object(
             onchain_module.TonCenterClient, "_get", side_effect=onchain_module.requests.ConnectionError("offline")

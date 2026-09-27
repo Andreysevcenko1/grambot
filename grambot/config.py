@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,31 @@ def _env_currency(name: str, default: str) -> str:
     return default
 
 
+def parse_windows(raw: str) -> List[Tuple[int, float]]:
+    """Parse ``"60:3.5,240:6,1440:10"`` into ``[(minutes, threshold_pct), ...]``.
+
+    Invalid entries are skipped with a warning; the result is sorted by
+    window length with duplicates collapsed (the last threshold wins).
+    """
+    windows: Dict[int, float] = {}
+    for entry in _split_csv(raw or ""):
+        try:
+            minutes_text, threshold_text = entry.split(":", 1)
+            minutes = int(minutes_text.strip())
+            threshold = float(threshold_text.strip().replace(",", "."))
+        except ValueError:
+            logger.warning("Ignoring invalid price window %r (expected MINUTES:PERCENT)", entry)
+            continue
+        if minutes <= 0 or threshold <= 0:
+            logger.warning("Ignoring non-positive price window %r", entry)
+            continue
+        windows[minutes] = threshold
+    return sorted(windows.items())
+
+
+DEFAULT_PRICE_ALERT_WINDOWS = "60:3.5,240:6,1440:10"
+
+
 DEFAULT_RSS_FEEDS = [
     "https://news.google.com/rss/search?q=TON+OR+Toncoin+OR+GRAM+OR+%22The+Open+Network%22&hl=en-US&gl=US&ceid=US:en",
     "https://cointelegraph.com/rss",
@@ -127,6 +152,18 @@ class Settings:
     price_window_minutes: int = 20
     price_alert_threshold_pct: float = 5.0
     price_alert_cooldown_minutes: int = 60
+    # Slower windows (minutes, pct) for gradual moves; the fast window above is always added.
+    price_alert_windows: List[Tuple[int, float]] = field(
+        default_factory=lambda: parse_windows(DEFAULT_PRICE_ALERT_WINDOWS)
+    )
+    enable_volume_alerts: bool = True
+    volume_poll_interval_seconds: int = 300
+    volume_spike_ratio: float = 4.0  # trailing-hour volume vs median hourly volume of the previous day
+    volume_spike_min_move_pct: float = 2.0  # ...and the price moved at least this much over the hour
+    volume_alert_cooldown_minutes: int = 180
+    market_confirms_news: bool = True  # a single-source item passes verification during a market move
+    market_active_minutes: int = 180
+    market_confirmed_news_limit: int = 3  # max single-source items confirmed per active period
     retention_days: int = 30
     enable_commands: bool = True
     send_startup_message: bool = True
@@ -155,6 +192,18 @@ class Settings:
     def heartbeat_file(self) -> str:
         return self.heartbeat_path or f"{self.database_path}.heartbeat"
 
+    @property
+    def all_price_windows(self) -> List[Tuple[int, float]]:
+        """Every alert window incl. the fast one, sorted by length."""
+        windows = dict(self.price_alert_windows)
+        windows.setdefault(self.price_window_minutes, self.price_alert_threshold_pct)
+        return sorted(windows.items())
+
+    @property
+    def price_window_lengths(self) -> List[int]:
+        # 60 is always computed: the volume rule and the /price summary use it.
+        return sorted({minutes for minutes, _ in self.all_price_windows} | {60})
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -174,6 +223,15 @@ class Settings:
             price_window_minutes=max(1, _env_int("PRICE_WINDOW_MINUTES", 20)),
             price_alert_threshold_pct=max(0.1, _env_float("PRICE_ALERT_THRESHOLD_PCT", 5.0)),
             price_alert_cooldown_minutes=max(0, _env_int("PRICE_ALERT_COOLDOWN_MINUTES", 60)),
+            price_alert_windows=parse_windows(os.getenv("PRICE_ALERT_WINDOWS", DEFAULT_PRICE_ALERT_WINDOWS)),
+            enable_volume_alerts=_env_bool("ENABLE_VOLUME_ALERTS", True),
+            volume_poll_interval_seconds=max(60, _env_int("VOLUME_POLL_INTERVAL_SECONDS", 300)),
+            volume_spike_ratio=max(1.5, _env_float("VOLUME_SPIKE_RATIO", 4.0)),
+            volume_spike_min_move_pct=max(0.0, _env_float("VOLUME_SPIKE_MIN_MOVE_PCT", 2.0)),
+            volume_alert_cooldown_minutes=max(0, _env_int("VOLUME_ALERT_COOLDOWN_MINUTES", 180)),
+            market_confirms_news=_env_bool("MARKET_CONFIRMS_NEWS", True),
+            market_active_minutes=max(1, _env_int("MARKET_ACTIVE_MINUTES", 180)),
+            market_confirmed_news_limit=max(0, _env_int("MARKET_CONFIRMED_NEWS_LIMIT", 3)),
             retention_days=max(1, _env_int("RETENTION_DAYS", 30)),
             enable_commands=_env_bool("ENABLE_COMMANDS", True),
             send_startup_message=_env_bool("SEND_STARTUP_MESSAGE", True),

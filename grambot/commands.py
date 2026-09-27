@@ -12,7 +12,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from . import price as price_module
 from .notifier import (
     DISCLAIMER,
     TelegramNotifier,
@@ -20,6 +19,7 @@ from .notifier import (
     fmt_time,
     fmt_ton,
     fmt_usd,
+    fmt_window,
     format_news_alert,
     format_price_context,
 )
@@ -222,6 +222,7 @@ class CommandHandler(threading.Thread):
         lines.append(f"Сигналов за 24ч: {self.storage.count_signals_since(day_ago)}")
         lines.append(f"Классификатор: {html.escape(m.classifier_name)}")
         lines.append(f"Интервал: новости {self.settings.poll_interval_seconds // 60} мин, цена {self.settings.price_poll_interval_seconds // 60} мин")
+        lines.append(self._market_status_line())
         lines.append(self._onchain_status_line())
         lines.append(self._health_status_line())
         muted_until = m.muted_until()
@@ -248,15 +249,36 @@ class CommandHandler(threading.Thread):
     def cmd_price(self, args: List[str]) -> str:
         move = self.monitor.poll_price(alert=False)
         if move is None:
-            move = self.monitor._localize(
-                price_module.move_from_history(self.storage, self.settings.price_window_minutes)
-            )
+            move = self.monitor.current_price_move()
         if move is None:
             return "Данные о цене пока недоступны."
         lines = ["💰 <b>TON / GRAM</b>"] + format_price_context(move)
         provider = self.monitor.price_client.last_provider or move.provider
-        lines.append(f"<i>Источник: {html.escape(provider)} · {fmt_time(time.time())}</i>")
+        source = f"Источник: {html.escape(provider)}"
+        if move.volume_provider:
+            source += f", объём {html.escape(move.volume_provider)}"
+        lines.append(f"<i>{source} · {fmt_time(time.time())}</i>")
+        active_until = self.monitor.market_active_until()
+        if active_until:
+            lines.append(f"⚡ Рынок в движении (до {fmt_time(active_until)}): одиночные новости показываются сразу")
         return "\n".join(lines)
+
+    def _market_status_line(self) -> str:
+        windows = " · ".join(
+            f"{fmt_pct(threshold, 1).lstrip('+')}/{fmt_window(minutes)}" for minutes, threshold in self.settings.all_price_windows
+        )
+        line = f"Алерты цены: {windows}"
+        if self.settings.enable_volume_alerts:
+            client = self.monitor.volume_client
+            if client.last_stats is not None:
+                line += f"; объём ×{self.settings.volume_spike_ratio:g} ({html.escape(client.last_provider or '?')})"
+            elif client.last_error:
+                line += f"; объём недоступен — {html.escape(str(client.last_error)[:60])}"
+            else:
+                line += f"; объём ×{self.settings.volume_spike_ratio:g} (ожидает данных)"
+        else:
+            line += "; объём выключен"
+        return line
 
     def _onchain_status_line(self) -> str:
         info = self.monitor.onchain_status()

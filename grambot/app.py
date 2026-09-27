@@ -10,6 +10,7 @@ import threading
 import time
 from typing import List, Optional, Sequence, Tuple
 
+from . import market as market_module
 from . import onchain as onchain_module
 from . import price as price_module
 from .commands import MUTED_UNTIL_KEY, CommandHandler
@@ -21,6 +22,7 @@ from .notifier import (
     format_news_alert,
     format_price_alert,
     format_startup,
+    format_volume_alert,
     format_whale_alert,
 )
 from .onchain import Labels, MasterchainState, ScanResult, TonCenterClient, Transfer
@@ -31,12 +33,16 @@ from .processing.filters import filter_fresh, filter_relevant
 from .processing.llm_classifier import LLMClassifier
 from .sources import NewsItem
 from .sources.rss import FeedResult, RSSSource
-from .storage import Storage
+from .storage import SeenItem, Storage
 from .supervisor import Supervisor, is_child_process, restart_info
 
 logger = logging.getLogger(__name__)
 
 LAST_PRICE_ALERT_KEY = "last_price_alert_at"
+LAST_VOLUME_ALERT_KEY = "last_volume_alert_at"
+MARKET_ACTIVE_UNTIL_KEY = "market_active_until"
+PRICE_WINDOW_FIRED_KEY = "price_window_fired_{minutes}"  # set while a window waits to re-arm
+VOLUME_FIRED_KEY = "volume_alert_fired"
 LAST_PRUNE_KEY = "last_prune_at"
 ONCHAIN_LAST_UTIME_KEY = "onchain_last_utime"
 LAST_WHALE_ALERT_KEY = "last_whale_alert_at"
@@ -44,6 +50,10 @@ NETWORK_STALLED_SINCE_KEY = "network_stalled_since"
 ONCHAIN_STUCK_FAILURES = 5
 ONCHAIN_STUCK_SKIP_SECONDS = 60
 COMMAND_HANDLER_RESTART_DELAY = 30.0
+
+
+def _describe_hits(hits: Sequence[Tuple[int, float, float]]) -> str:
+    return ", ".join(f"{change:+.2f}%/{minutes}m" for minutes, change, _ in hits)
 
 
 class GramTonMonitor:
@@ -79,6 +89,10 @@ class GramTonMonitor:
             display_currency=settings.display_currency,
         )
         self.fiat_rates = price_module.FiatRates()
+        self.volume_client = market_module.VolumeClient(
+            symbol=settings.price_symbol, ttl=float(settings.volume_poll_interval_seconds)
+        )
+        self._market_confirmed_at: List[float] = []  # send times of market-confirmed single-source news
 
         self.onchain_enabled = settings.enable_onchain
         self.ton_client = TonCenterClient(api_key=settings.toncenter_api_key)
@@ -203,6 +217,11 @@ class GramTonMonitor:
         sources = self.storage.cluster_sources(cluster_id)
         trusted = any(self.is_trusted_source(s) for s in sources)
         verified = trusted or len(sources) >= self.settings.min_sources_for_verified
+        market_confirmed = False
+        if not verified and self._market_can_confirm(item):
+            # The market is already moving: a lone, fresh headline is worth
+            # showing now (labelled as such) instead of waiting for a second source.
+            verified = market_confirmed = True
         if not verified:
             logger.info("Unverified (%d source): %r [%s]", len(sources), item.title, item.source)
             return False
@@ -228,12 +247,15 @@ class GramTonMonitor:
             sources=sources,
             verified=verified,
             price_move=move,
+            market_confirmed=market_confirmed,
         )
         if not self.notifier.send(message):
             logger.warning("Telegram send failed for %r", item.title)
             return False
 
         self.storage.mark_notified(cluster_id)
+        if market_confirmed:
+            self._market_confirmed_at.append(time.time())
         self.storage.record_signal(
             kind="news",
             title=item.title,
@@ -245,10 +267,45 @@ class GramTonMonitor:
             cluster_id=cluster_id,
         )
         logger.info(
-            "Notified: %r (sentiment=%s strength=%s sources=%d)",
+            "Notified: %r (sentiment=%s strength=%s sources=%d%s)",
             item.title, classification.sentiment, classification.strength, len(sources),
+            " market-confirmed" if market_confirmed else "",
         )
         return True
+
+    def market_active_until(self) -> Optional[float]:
+        until = self.storage.get_float(MARKET_ACTIVE_UNTIL_KEY)
+        if until and until > time.time():
+            return until
+        return None
+
+    def _mark_market_active(self) -> None:
+        until = time.time() + self.settings.market_active_minutes * 60
+        self.storage.set_value(MARKET_ACTIVE_UNTIL_KEY, str(until))
+
+    def _market_can_confirm(self, item: NewsItem) -> bool:
+        if not self.settings.market_confirms_news or not self.market_active_until():
+            return False
+        cutoff = time.time() - self.settings.market_active_minutes * 60
+        if item.published_at < cutoff:
+            return False  # an old headline cannot be "confirmed" by today's move
+        self._market_confirmed_at = [t for t in self._market_confirmed_at if t >= cutoff]
+        return len(self._market_confirmed_at) < self.settings.market_confirmed_news_limit
+
+    def recent_causes(self, hours: float = 3.0, limit: int = 2) -> List[SeenItem]:
+        """Latest relevant headlines (one per cluster) that may explain a move."""
+        items = self.storage.recent_items(time.time() - hours * 3600, limit=20)
+        causes: List[SeenItem] = []
+        seen_clusters = set()
+        for item in items:
+            key = item.cluster_id or item.title
+            if key in seen_clusters:
+                continue
+            seen_clusters.add(key)
+            causes.append(item)
+            if len(causes) >= limit:
+                break
+        return causes
 
     # -- price -------------------------------------------------------------
     def poll_price(self, alert: bool = True) -> Optional[PriceMove]:
@@ -259,7 +316,9 @@ class GramTonMonitor:
                 self._report_health("price", False, self.price_client.last_error)
                 return None
             self._report_health("price", True)
-            move = price_module.compute_move(self.storage, snapshot, self.settings.price_window_minutes)
+            move = price_module.compute_move(
+                self.storage, snapshot, self.settings.price_window_minutes, self.settings.price_window_lengths
+            )
             self.storage.add_price_point(
                 snapshot.price_usd,
                 snapshot.volume_24h_usd,
@@ -268,45 +327,147 @@ class GramTonMonitor:
                 provider=snapshot.provider,
             )
             self.last_price_poll_at = snapshot.fetched_at
+            self._attach_volume(move)
         move = self._localize(move)
-        if alert:
-            self._maybe_price_alert(move)
+        self._maybe_market_alert(move, send=alert)
         return move
 
-    def _maybe_price_alert(self, move: PriceMove) -> bool:
-        if not price_module.is_spike(move, self.settings.price_alert_threshold_pct):
+    def _attach_volume(self, move: PriceMove, force: bool = False) -> PriceMove:
+        if not self.settings.enable_volume_alerts:
+            return move
+        try:
+            stats = self.volume_client.fetch(force=force)
+        except Exception as exc:  # pragma: no cover - defensive: volume is optional
+            logger.warning("Volume fetch failed unexpectedly: %s", exc)
+            stats = None
+        return market_module.attach_volume(move, stats)
+
+    def _window_fired(self, minutes: int) -> bool:
+        return self.storage.get_value(PRICE_WINDOW_FIRED_KEY.format(minutes=minutes)) is not None
+
+    def _set_window_fired(self, minutes: int, fired: bool) -> None:
+        self.storage.set_value(PRICE_WINDOW_FIRED_KEY.format(minutes=minutes), "1" if fired else None)
+
+    def _rearm_windows(self, move: PriceMove) -> None:
+        """A window that already alerted re-arms once its change halves."""
+        for minutes, threshold in self.settings.all_price_windows:
+            change = move.window_changes.get(minutes)
+            if change is not None and abs(change) < threshold / 2 and self._window_fired(minutes):
+                self._set_window_fired(minutes, False)
+                logger.info("Price window %d min re-armed (%.2f%%)", minutes, change)
+        ratio = move.volume_1h_ratio
+        if ratio is not None and ratio < self.settings.volume_spike_ratio / 2:
+            if self.storage.get_value(VOLUME_FIRED_KEY) is not None:
+                self.storage.set_value(VOLUME_FIRED_KEY, None)
+                logger.info("Volume alert re-armed (ratio %.2f)", ratio)
+
+    def _maybe_market_alert(self, move: PriceMove, send: bool = True) -> bool:
+        """Multi-window price alerts plus volume-burst alerts, with hysteresis.
+
+        Every window that crosses its threshold marks the market as active (so
+        single-source news can be confirmed) even when the alert itself is held
+        back by a cooldown or ``send`` is False; a window alerts once and
+        re-arms after its change drops below half the threshold.
+        """
+        self._rearm_windows(move)
+        now = time.time()
+        hits = market_module.triggered_windows(move, self.settings.all_price_windows)
+        volume_spike = self.settings.enable_volume_alerts and market_module.is_volume_spike(
+            move, self.settings.volume_spike_ratio, self.settings.volume_spike_min_move_pct
+        )
+        if not hits and not volume_spike:
             return False
-        last = self.storage.get_float(LAST_PRICE_ALERT_KEY) or 0.0
-        cooldown = self.settings.price_alert_cooldown_minutes * 60
-        if time.time() - last < cooldown:
-            logger.info("Price spike %.2f%% within cooldown; not alerting", move.window_change_pct or 0.0)
+        self._mark_market_active()
+        if not send:
             return False
+
+        armed_hits = [h for h in hits if not self._window_fired(h[0])]
+        volume_armed = volume_spike and self.storage.get_value(VOLUME_FIRED_KEY) is None
+        sent = False
+        if armed_hits:
+            last = self.storage.get_float(LAST_PRICE_ALERT_KEY) or 0.0
+            if now - last < self.settings.price_alert_cooldown_minutes * 60:
+                logger.info("Price move %s within cooldown; not alerting", _describe_hits(armed_hits))
+            else:
+                sent = self._send_price_alert(move, hits, armed_hits)
+        if volume_spike and not sent and volume_armed:
+            last = self.storage.get_float(LAST_VOLUME_ALERT_KEY) or 0.0
+            if now - last < self.settings.volume_alert_cooldown_minutes * 60:
+                logger.info("Volume spike x%.1f within cooldown; not alerting", move.volume_1h_ratio or 0.0)
+            else:
+                sent = self._send_volume_alert(move)
+        return sent
+
+    def _send_price_alert(
+        self,
+        move: PriceMove,
+        hits: Sequence[Tuple[int, float, float]],
+        armed_hits: Sequence[Tuple[int, float, float]],
+    ) -> bool:
         allowed, why = self.can_notify()
         if not allowed:
             logger.info("Price alert suppressed (%s)", why)
             return False
-        if not self.notifier.send(format_price_alert(move)):
+        minutes, change, threshold = market_module.strongest_window(armed_hits)
+        causes = self.recent_causes()
+        if not self.notifier.send(format_price_alert(move, minutes, causes)):
             return False
-        self.storage.set_value(LAST_PRICE_ALERT_KEY, str(time.time()))
+        now = time.time()
+        self.storage.set_value(LAST_PRICE_ALERT_KEY, str(now))
+        for hit_minutes, _, _ in hits:  # the message covers every window that is currently over its threshold
+            self._set_window_fired(hit_minutes, True)
+        if move.volume_1h_ratio is not None and move.volume_1h_ratio >= self.settings.volume_spike_ratio:
+            self.storage.set_value(VOLUME_FIRED_KEY, "1")  # volume is already shown in this alert
+            self.storage.set_value(LAST_VOLUME_ALERT_KEY, str(now))
         self.storage.record_signal(
             kind="price",
-            title=f"TON {move.window_change_pct:+.2f}% за {move.window_minutes} мин",
+            title=f"TON {change:+.2f}% за {minutes} мин",
             url=None,
-            sentiment="positive" if (move.window_change_pct or 0) > 0 else "negative",
-            strength="high" if abs(move.window_change_pct or 0) >= 2 * self.settings.price_alert_threshold_pct else "medium",
-            source_count=0,
+            sentiment="positive" if change > 0 else "negative",
+            strength="high" if abs(change) >= 2 * threshold else "medium",
+            source_count=len(causes),
             price_at_send=move.price_usd,
         )
-        logger.info("Price alert sent: %.2f%%", move.window_change_pct or 0.0)
+        logger.info("Price alert sent: %s (causes: %d)", _describe_hits(hits), len(causes))
         return True
+
+    def _send_volume_alert(self, move: PriceMove) -> bool:
+        allowed, why = self.can_notify()
+        if not allowed:
+            logger.info("Volume alert suppressed (%s)", why)
+            return False
+        causes = self.recent_causes()
+        if not self.notifier.send(format_volume_alert(move, causes)):
+            return False
+        now = time.time()
+        self.storage.set_value(LAST_VOLUME_ALERT_KEY, str(now))
+        self.storage.set_value(VOLUME_FIRED_KEY, "1")
+        change_1h = move.window_changes.get(60) or 0.0
+        self.storage.record_signal(
+            kind="volume",
+            title=f"Объём TON ×{move.volume_1h_ratio or 0:.1f} за час ({change_1h:+.2f}%)",
+            url=None,
+            sentiment="positive" if change_1h > 0 else ("negative" if change_1h < 0 else "unknown"),
+            strength="high" if (move.volume_1h_ratio or 0) >= 2 * self.settings.volume_spike_ratio else "medium",
+            source_count=len(causes),
+            price_at_send=move.price_usd,
+        )
+        logger.info("Volume alert sent: x%.1f, 1h %+.2f%% (causes: %d)", move.volume_1h_ratio or 0.0, change_1h, len(causes))
+        return True
+
+    # Backwards-compatible name used by older callers/tests.
+    _maybe_price_alert = _maybe_market_alert
 
     def current_price_move(self) -> Optional[PriceMove]:
         latest = self.storage.latest_price()
         max_age = 2 * self.settings.price_poll_interval_seconds
         if latest and time.time() - latest.fetched_at <= max_age:
-            return self._localize(
-                price_module.move_from_history(self.storage, self.settings.price_window_minutes)
+            move = price_module.move_from_history(
+                self.storage, self.settings.price_window_minutes, self.settings.price_window_lengths
             )
+            if move is not None:
+                market_module.attach_volume(move, self.volume_client.last_stats)
+            return self._localize(move)
         return self.poll_price(alert=False)
 
     # -- on-chain ------------------------------------------------------------
