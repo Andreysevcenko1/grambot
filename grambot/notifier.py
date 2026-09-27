@@ -175,11 +175,20 @@ def format_news_alert(
     verified: bool = True,
     price_move: Optional[PriceMove] = None,
     market_confirmed: bool = False,
+    priority: bool = False,
 ) -> str:
-    header = SENTIMENT_HEADERS.get(classification.sentiment, SENTIMENT_HEADERS["unknown"])
-    strength = STRENGTH_LABELS.get(classification.strength, classification.strength)
+    unrated = priority and classification.sentiment == "neutral"
+    if unrated:
+        header = "⚪ Влияние не оценено — прочитайте пост"
+    else:
+        header = SENTIMENT_HEADERS.get(classification.sentiment, SENTIMENT_HEADERS["unknown"])
+    strength = "не оценена" if unrated else STRENGTH_LABELS.get(classification.strength, classification.strength)
 
-    lines = [header, f"<b>{html.escape(item.title)}</b>", ""]
+    lines: List[str] = []
+    if priority:
+        # Founder/official channel: delivered at once, before any price move.
+        lines.append(f"🔔 <b>Первоисточник: {html.escape(item.source)}</b>")
+    lines.extend([header, f"<b>{html.escape(item.title)}</b>", ""])
     lines.append(f"Сила: {strength}")
     source_line = f"Источники: {source_count}"
     if sources:

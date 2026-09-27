@@ -147,6 +147,30 @@ DEFAULT_TRUSTED_SOURCES = [
     "@binance_announcements",
 ]
 
+# Sources whose word moves the market on its own (the founder, the official
+# channels). Their posts are trusted implicitly, are shown even when the
+# lexicon finds no sentiment words ("Stars can now be converted to Toncoin")
+# and are polled more often than the rest of the feeds.
+DEFAULT_PRIORITY_SOURCES = [
+    "@durov",
+    "@telegram",
+    "@tonblockchain",
+    "@toncoin",
+    "@gram",
+    "@tonstatus",
+]
+
+# A post from a priority source counts as relevant, and is alerted even without
+# sentiment words, when it touches the ecosystem's economy (not any Telegram
+# feature and not validator housekeeping). Same matching rules as KEYWORDS
+# ("*" = prefix, short tickers case-sensitive).
+DEFAULT_PRIORITY_KEYWORDS = [
+    "TON", "Toncoin", "GRAM", "The Open Network", "TON Foundation",
+    "blockchain*", "crypto*", "wallet*", "Stars", "Gifts", "Fragment", "USDT",
+    "stablecoin*", "token*", "NFT*", "staking",
+    "блокчейн*", "крипт*", "кошел*", "токен*", "звёзд*", "звезд*", "подарк*", "стейкинг*",
+]
+
 
 @dataclass
 class Settings:
@@ -155,6 +179,12 @@ class Settings:
     rss_feeds: List[str] = field(default_factory=lambda: list(DEFAULT_RSS_FEEDS))
     keywords: List[str] = field(default_factory=lambda: list(DEFAULT_KEYWORDS))
     trusted_sources: List[str] = field(default_factory=lambda: list(DEFAULT_TRUSTED_SOURCES))
+    # Priority sources: alerted even without sentiment words (when a priority
+    # keyword matches), exempt from the hourly cap, polled every
+    # ``priority_poll_interval_seconds`` (0 disables the extra polling).
+    priority_sources: List[str] = field(default_factory=lambda: list(DEFAULT_PRIORITY_SOURCES))
+    priority_keywords: List[str] = field(default_factory=lambda: list(DEFAULT_PRIORITY_KEYWORDS))
+    priority_poll_interval_seconds: int = 60
     poll_interval_seconds: int = 180
     price_poll_interval_seconds: int = 120
     feed_timeout_seconds: int = 15
@@ -236,12 +266,18 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        priority_poll = _env_int("PRIORITY_POLL_INTERVAL_SECONDS", 60)
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             rss_feeds=_env_list("RSS_FEEDS", DEFAULT_RSS_FEEDS),
             keywords=_env_list("KEYWORDS", DEFAULT_KEYWORDS),
             trusted_sources=_env_list("TRUSTED_SOURCES", DEFAULT_TRUSTED_SOURCES),
+            priority_sources=_env_list("PRIORITY_SOURCES", DEFAULT_PRIORITY_SOURCES),
+            priority_keywords=_env_list("PRIORITY_KEYWORDS", DEFAULT_PRIORITY_KEYWORDS),
+            # 0 disables the fast lane; anything else is clamped to >= 30 s so
+            # the Telegram web previews are not hammered.
+            priority_poll_interval_seconds=0 if priority_poll <= 0 else max(30, priority_poll),
             poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 180)),
             price_poll_interval_seconds=max(30, _env_int("PRICE_POLL_INTERVAL_SECONDS", 120)),
             feed_timeout_seconds=max(3, _env_int("FEED_TIMEOUT_SECONDS", 15)),

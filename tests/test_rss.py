@@ -74,6 +74,27 @@ def test_rss_source_fetches_all_in_configured_order():
     assert len(items) == 3
 
 
+def test_rss_source_subset_fetch_merges_into_last_results():
+    calls = []
+
+    def fake_fetch(url, timeout, session):
+        calls.append(url)
+        return parse_feed(PLAIN if "b" in url else GOOGLE_NEWS, url)
+
+    source = RSSSource(["https://a", "https://b", "https://c"], timeout=3)
+    with patch("grambot.sources.rss.fetch_feed", side_effect=fake_fetch):
+        source.fetch_all()
+        first = list(source.last_results)
+        calls.clear()
+        subset = source.fetch_all(["https://b"])
+    assert calls == ["https://b"]
+    assert [r.url for r in subset] == ["https://b"]
+    # Status keeps every feed, in configured order, with the refreshed entry swapped in.
+    assert [r.url for r in source.last_results] == ["https://a", "https://b", "https://c"]
+    assert source.last_results[1] is subset[0] and source.last_results[0] is first[0]
+    assert source.fetch_all([]) == []
+
+
 def test_strip_html():
     assert strip_html("<p>a&amp;b</p>  <br/>c") == "a&b c"
     assert strip_html("") == ""

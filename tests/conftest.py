@@ -64,7 +64,8 @@ class FakeSource:
     def queue(self, items: List[NewsItem]):
         self.batches.append(items)
 
-    def fetch_all(self):
+    def fetch_all(self, urls=None):
+        self.last_urls = urls
         items = self.batches.pop(0) if self.batches else []
         self.last_results = [FeedResult(url="https://fake/feed", ok=True, items=items, feed_title="Fake")]
         return self.last_results
