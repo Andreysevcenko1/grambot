@@ -37,6 +37,9 @@ OKX_LIQUIDATIONS_URL = "https://www.okx.com/api/v5/public/liquidation-orders"
 
 DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 DEFAULT_BACKOFF_SECONDS = 600.0
+# Providers that keep failing (geo-blocked exchanges, e.g. Bybit/Binance from a
+# US host) are retried less and less often, up to this pause.
+MAX_BACKOFF_SECONDS = 6 * 3600.0
 LIQUIDATION_WINDOW_SECONDS = 3600.0
 OKX_LIQUIDATION_PAGE = 100  # the endpoint returns the latest 100 orders
 STATIC_INFO_TTL = 6 * 3600.0  # funding intervals / contract sizes rarely change
@@ -307,6 +310,7 @@ class FuturesClient:
         self.timeout = timeout
         self.ttl = ttl
         self.backoff_until: Dict[str, float] = {}
+        self.failures: Dict[str, int] = {}  # consecutive failures per provider
         self.last_provider: Optional[str] = None
         self.last_error: Optional[str] = None
         self.last_snapshot: Optional[FuturesSnapshot] = None
@@ -315,6 +319,21 @@ class FuturesClient:
         self.liquidations_error: Optional[str] = None
         self.liquidations_backoff_until: float = 0.0
         self.liquidations_attempt_at: float = 0.0
+        self.liquidations_failures: int = 0
+
+    @staticmethod
+    def backoff_for(failures: int) -> float:
+        """10 min after the first failure, doubling each time, capped at 6 h."""
+        return min(DEFAULT_BACKOFF_SECONDS * (2 ** max(failures - 1, 0)), MAX_BACKOFF_SECONDS)
+
+    def _provider_failed(self, name: str, exc: Exception, now: float) -> None:
+        self.failures[name] = self.failures.get(name, 0) + 1
+        pause = self.backoff_for(self.failures[name])
+        self.backoff_until[name] = now + pause
+        self.last_error = f"{name}: {exc}"
+        # Warn once, then stay quiet: a geo-blocked exchange fails at every retry.
+        log = logger.warning if self.failures[name] == 1 else logger.info
+        log("Futures provider %s failed (%d in a row, next try in %.0f min): %s", name, self.failures[name], pause / 60, exc)
 
     def providers(self) -> List[Tuple[str, Callable[[], FuturesSnapshot]]]:
         return [
@@ -341,15 +360,14 @@ class FuturesClient:
                 logger.info("Futures provider %s rate limited; backing off %.0fs", name, exc.retry_after)
                 continue
             except (requests.RequestException, ValueError, TypeError, KeyError, IndexError) as exc:
-                self.backoff_until[name] = now + DEFAULT_BACKOFF_SECONDS
-                self.last_error = f"{name}: {exc}"
-                logger.warning("Futures provider %s failed: %s", name, exc)
+                self._provider_failed(name, exc, now)
                 continue
             if snapshot.open_interest is None and snapshot.funding_rate is None:
-                self.last_error = f"{name}: empty snapshot"
+                self._provider_failed(name, ValueError("empty snapshot"), now)
                 continue
             if self.last_provider and self.last_provider != name:
                 logger.info("Futures provider switched %s -> %s", self.last_provider, name)
+            self.failures[name] = 0
             self.last_provider = name
             self.last_error = None
             self.last_snapshot = snapshot
@@ -370,10 +388,14 @@ class FuturesClient:
             self.liquidations_error = str(exc)
             return None
         except (requests.RequestException, ValueError, TypeError, KeyError, IndexError) as exc:
-            self.liquidations_backoff_until = now + DEFAULT_BACKOFF_SECONDS
+            self.liquidations_failures += 1
+            pause = self.backoff_for(self.liquidations_failures)
+            self.liquidations_backoff_until = now + pause
             self.liquidations_error = f"okx: {exc}"
-            logger.warning("Liquidation data failed: %s", exc)
+            log = logger.warning if self.liquidations_failures == 1 else logger.info
+            log("Liquidation data failed (%d in a row, next try in %.0f min): %s", self.liquidations_failures, pause / 60, exc)
             return None
+        self.liquidations_failures = 0
         self.liquidations_error = None
         self.last_liquidations = stats
         return stats

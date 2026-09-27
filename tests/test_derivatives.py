@@ -1,3 +1,4 @@
+import logging
 import time
 from unittest.mock import patch
 
@@ -196,6 +197,34 @@ def test_liquidation_fetch_backs_off_after_failure():
     with patch.object(d, "fetch_okx_liquidations", return_value=stats):
         assert client.fetch_liquidations() is None  # still backing off
         assert client.fetch_liquidations(force=True) is stats
+        assert client.liquidations_failures == 0
+
+
+def test_repeated_provider_failures_back_off_exponentially(caplog):
+    """A geo-blocked exchange must not be hammered (or logged) every 10 minutes."""
+    assert FuturesClient.backoff_for(1) == 600.0
+    assert FuturesClient.backoff_for(2) == 1200.0
+    assert FuturesClient.backoff_for(4) == 4800.0
+    assert FuturesClient.backoff_for(20) == d.MAX_BACKOFF_SECONDS
+
+    client = FuturesClient("GRAMUSDT", ttl=0.0)
+    blocked = lambda: (_ for _ in ()).throw(requests.HTTPError("403 Forbidden"))
+    okx = lambda: make_snapshot("okx")
+    with patch.object(client, "providers", return_value=[("bybit", blocked), ("okx", okx)]):
+        with caplog.at_level(logging.INFO, logger="grambot.derivatives"):
+            for attempt in range(1, 4):
+                client.backoff_until.clear()  # pretend the pause has elapsed
+                assert client.fetch(force=True).provider == "okx"
+                assert client.failures["bybit"] == attempt
+                assert client.backoff_until["bybit"] - time.time() > FuturesClient.backoff_for(attempt) - 5
+        levels = [r.levelno for r in caplog.records if "bybit" in r.getMessage() and "failed" in r.getMessage()]
+        assert levels == [logging.WARNING, logging.INFO, logging.INFO]  # warn once, then stay quiet
+        assert client.last_error is None  # okx answered, so the chain as a whole is healthy
+
+    client.backoff_until.clear()
+    with patch.object(client, "providers", return_value=[("bybit", okx)]):
+        client.fetch(force=True)
+        assert client.failures["bybit"] == 0  # a success resets the escalation
 
 
 # -- history and detector -------------------------------------------------------
