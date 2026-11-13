@@ -24,6 +24,7 @@ from .notifier import (
     format_futures_status,
     format_news_alert,
     format_price_context,
+    format_watch_alert,
 )
 from .derivatives import base_asset
 from .health import COMPONENT_TITLES, current_rss_mb
@@ -65,6 +66,19 @@ COMMANDS = [
     ("check", "Проверить ленты сейчас"),
     ("test", "Отправить тестовый сигнал"),
     ("mute", "Отключить уведомления на N минут"),
+    ("unmute", "Включить уведомления"),
+    ("help", "Справка"),
+]
+
+WATCH_COMMANDS = [
+    ("watchlist", "Персоны и монеты"),
+    ("status", "Состояние бота"),
+    ("recent", "Последние новости"),
+    ("stats", "Количество сигналов"),
+    ("feeds", "Состояние источников"),
+    ("check", "Проверить источники"),
+    ("test", "Тестовое уведомление"),
+    ("mute", "Пауза уведомлений"),
     ("unmute", "Включить уведомления"),
     ("help", "Справка"),
 ]
@@ -133,7 +147,7 @@ class CommandHandler(threading.Thread):
         if not self.notifier.is_configured:
             logger.info("Telegram not configured; command handler idle")
             return
-        self.notifier.set_commands(COMMANDS)
+        self.notifier.set_commands(WATCH_COMMANDS if self.monitor.watchlist_mode else COMMANDS)
         offset: Optional[int] = None
         try:
             offset = self._initial_offset()
@@ -194,6 +208,7 @@ class CommandHandler(threading.Thread):
             "/start": self.cmd_help,
             "/help": self.cmd_help,
             "/status": self.cmd_status,
+            "/watchlist": self.cmd_watchlist,
             "/price": self.cmd_price,
             "/whales": self.cmd_whales,
             "/futures": self.cmd_futures,
@@ -212,7 +227,24 @@ class CommandHandler(threading.Thread):
 
     # -- commands ----------------------------------------------------------
     def cmd_help(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            return (
+                "🤖 <b>Монитор персон и монет</b>\n"
+                "Публикации и сообщения о персонах с упоминанием криптовалют; "
+                "также объявления о листингах. Направление цены не предсказывается.\n\n"
+                "/watchlist — персоны и монеты\n/status — состояние\n/recent — последние новости\n"
+                "/stats — количество сигналов\n/feeds — источники\n/check — проверить сейчас\n"
+                "/test — тест\n/mute [минуты] — пауза\n/unmute — снять паузу\n\n" + DISCLAIMER
+            )
         return HELP_TEXT
+
+    def cmd_watchlist(self, args: List[str]) -> str:
+        if not self.monitor.watchlist_mode:
+            return "Монитор персон выключен: NEWS_MODE=classic."
+        lines = ["👥 <b>Персоны и связанные монеты</b>"]
+        lines.extend(f"• {html.escape(p.name)} → {html.escape(p.coins)}" for p in self.monitor.watch_people)
+        lines.append("\nТакже отслеживаются объявления о листингах Binance, Upbit и OKX.")
+        return "\n".join(lines)
 
     def cmd_status(self, args: List[str]) -> str:
         m = self.monitor
@@ -223,7 +255,18 @@ class CommandHandler(threading.Thread):
         lines = ["📊 <b>Состояние</b>", f"Работает: {_fmt_duration(now - m.started_at)}"]
         if m.last_news_poll_at:
             lines.append(f"Последняя проверка лент: {fmt_time(m.last_news_poll_at)}")
-        lines.append(f"Источники: {ok}/{len(results)} ок" if results else f"Источники: {len(self.settings.rss_feeds)} (ещё не опрошены)")
+        feed_count = len(m.watch_feeds) if m.watchlist_mode else len(self.settings.rss_feeds)
+        lines.append(f"Источники: {ok}/{len(results)} ок" if results else f"Источники: {feed_count} (ещё не опрошены)")
+        if m.watchlist_mode:
+            lines.append(f"Сигналов за 24ч: {self.storage.count_watch_signals(day_ago)}")
+            lines.append(f"Режим: персоны и листинги · персон: {len(m.watch_people)}")
+            lines.append(f"Интервал опроса: {self.settings.poll_interval_seconds} с")
+            lines.append("Цена, объём, деривативы и ончейн-алерты: выключены")
+            lines.append(self._health_status_line())
+            muted_until = m.muted_until()
+            if muted_until:
+                lines.append(f"🔇 Уведомления на паузе до {fmt_time(muted_until)}")
+            return "\n".join(lines)
         lines.append(f"Релевантных новостей за 24ч: {self.storage.count_items_since(day_ago)}")
         lines.append(f"Сигналов за 24ч: {self.storage.count_signals_since(day_ago)}")
         lines.append(f"Классификатор: {html.escape(m.classifier_name)}")
@@ -271,6 +314,8 @@ class CommandHandler(threading.Thread):
         return line
 
     def cmd_price(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            return "Мониторинг цены выключен в режиме персон."
         move = self.monitor.poll_price(alert=False)
         if move is None:
             move = self.monitor.current_price_move()
@@ -350,6 +395,8 @@ class CommandHandler(threading.Thread):
         return parts[0] + " " + " · ".join(parts[1:])
 
     def cmd_futures(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            return "Мониторинг деривативов выключен в режиме персон."
         m = self.monitor
         if not m.futures_enabled:
             return "Мониторинг деривативов выключен (ENABLE_FUTURES_ALERTS=false)."
@@ -368,6 +415,8 @@ class CommandHandler(threading.Thread):
         )
 
     def cmd_whales(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            return "Мониторинг крупных переводов выключен в режиме персон."
         m = self.monitor
         if not m.onchain_enabled and not m.whale_alert_enabled:
             return "Ончейн-мониторинг выключен (ENABLE_ONCHAIN=false), канал Whale Alert не подключён."
@@ -424,6 +473,17 @@ class CommandHandler(threading.Thread):
         limit = 5
         if args and args[0].isdigit():
             limit = max(1, min(15, int(args[0])))
+        if self.monitor.watchlist_mode:
+            signals = self.storage.recent_watch_signals(limit)
+            if not signals:
+                return "Сигналов о персонах и листингах пока нет."
+            lines = ["🗞 <b>Последние сигналы</b>"]
+            for signal in signals:
+                title = html.escape(signal.title)
+                if signal.url:
+                    title = f'<a href="{html.escape(signal.url, quote=True)}">{title}</a>'
+                lines.append(f"• {title}\n  <i>{fmt_time(signal.sent_at)}</i>")
+            return "\n".join(lines)
         items = self.storage.recent_items(time.time() - 7 * 86400, limit=limit)
         if not items:
             return "Релевантных новостей за последние 7 дней пока нет."
@@ -436,6 +496,8 @@ class CommandHandler(threading.Thread):
         return "\n".join(lines)
 
     def cmd_stats(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            return f"📊 Сигналов о персонах и листингах: {self.storage.count_watch_signals()}"
         s = self.storage.signal_stats()
         impulses = f"Импульсов (ранних предупреждений): {s.total_impulse}"
         if s.impulse_evaluated:
@@ -489,6 +551,9 @@ class CommandHandler(threading.Thread):
         return "🔄 Проверяю ленты… результат появится в логе, сигналы — здесь."
 
     def cmd_test(self, args: List[str]) -> str:
+        if self.monitor.watchlist_mode:
+            item = NewsItem("Тест", "ТЕСТ: новость про TON", "", "https://ton.org", time.time())
+            return format_watch_alert(item, "Тест → TON", "Тестовый источник")
         item = NewsItem(
             source="Тест",
             title="ТЕСТ: TON Foundation сообщила о сбое в сети",

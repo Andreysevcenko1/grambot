@@ -126,6 +126,10 @@ def parse_feed(content: bytes, feed_url: str, fetched_at: Optional[float] = None
 
 
 def fetch_feed(feed_url: str, timeout: float = 15.0, session: Optional[requests.Session] = None) -> FeedResult:
+    from ..watchlist import OKX_FEED, UPBIT_FEED
+    if feed_url in (UPBIT_FEED, OKX_FEED):
+        from .listings import fetch_listings
+        return fetch_listings(feed_url, "Upbit" if feed_url == UPBIT_FEED else "OKX", timeout, session)
     # Telegram channels (``https://t.me/s/<name>``, ``@name``) are scraped from
     # the public web preview instead of going through an RSS bridge.
     from .telegram_web import channel_from_url, fetch_channel  # local import: avoids a cycle

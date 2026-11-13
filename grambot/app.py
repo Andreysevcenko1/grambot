@@ -28,6 +28,7 @@ from .notifier import (
     format_startup,
     format_volume_alert,
     format_whale_alert,
+    format_watch_alert,
 )
 from .onchain import Labels, MasterchainState, ScanResult, TonCenterClient, Transfer
 from .price import PriceMove
@@ -42,6 +43,8 @@ from .sources.rss import FeedResult, RSSSource
 from .sources.telegram_web import channel_from_post_url, channel_from_url
 from .storage import SeenItem, Storage
 from .supervisor import Supervisor, is_child_process, restart_info
+from .watchlist import active_people, feed_urls, match_people, BINANCE_FEED, UPBIT_FEED, OKX_FEED
+from .sources.listings import listing_label
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,9 @@ class GramTonMonitor:
         self.classifier = classifier
         self.notifier = notifier
         self.classifier_name = classifier_name
+        self.watchlist_mode = settings.news_mode == "watchlist"
+        self.watch_people = active_people(settings.watchlist_disable) if self.watchlist_mode else []
+        self.watch_feeds = feed_urls(self.watch_people, settings.watchlist_aggregators) if self.watchlist_mode else []
 
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
@@ -104,7 +110,7 @@ class GramTonMonitor:
             feed for feed in settings.rss_feeds
             if (channel_from_url(feed) or "").lower() in self._priority_channels
         ]
-        self.priority_poll_enabled = bool(self._priority_feed_urls) and settings.priority_poll_interval_seconds > 0
+        self.priority_poll_enabled = not self.watchlist_mode and bool(self._priority_feed_urls) and settings.priority_poll_interval_seconds > 0
         self.last_priority_poll_at: Optional[float] = None
         self.price_client = price_module.PriceClient(
             coin_id=settings.coingecko_coin_id,
@@ -117,7 +123,7 @@ class GramTonMonitor:
         )
         self._market_confirmed_at: List[float] = []  # send times of market-confirmed single-source news
 
-        self.onchain_enabled = settings.enable_onchain
+        self.onchain_enabled = settings.enable_onchain and not self.watchlist_mode
         self.ton_client = TonCenterClient(api_key=settings.toncenter_api_key)
         self.labels = Labels(url=settings.labels_url or None)
         self._onchain_lock = threading.Lock()
@@ -126,11 +132,11 @@ class GramTonMonitor:
         self.last_masterchain: Optional[MasterchainState] = None
         self._onchain_failures = 0
         # Whale Alert's Telegram channel feeds the whale monitor without TON Center.
-        self.whale_alert_enabled = any(
+        self.whale_alert_enabled = not self.watchlist_mode and any(
             (channel_from_url(feed) or "").lower() == WHALE_ALERT_CHANNEL for feed in settings.rss_feeds
         )
 
-        self.futures_enabled = settings.enable_futures_alerts
+        self.futures_enabled = settings.enable_futures_alerts and not self.watchlist_mode
         self.futures_client = FuturesClient(symbol=settings.price_symbol)
         self._futures_lock = threading.Lock()
         self.last_futures_poll_at: Optional[float] = None
@@ -264,6 +270,8 @@ class GramTonMonitor:
 
     def _process_feed_results(self, results: Sequence[FeedResult], label: str) -> Tuple[int, int, List[Transfer]]:
         """Filter, cluster, classify and notify; caller holds ``_poll_lock``."""
+        if self.watchlist_mode:
+            return self._process_watch_results(results), sum(1 for r in results if r.ok), []
         items: List[NewsItem] = [item for r in results for item in r.items]
         fresh = filter_fresh(items, self.settings.max_item_age_hours)
         # Whale Alert transfer lines are data, not headlines: route them to
@@ -299,6 +307,60 @@ class GramTonMonitor:
             label, ok_feeds, len(results), len(items), len(fresh), len(relevant), new_items, notified, len(whale_transfers),
         )
         return notified, ok_feeds, whale_transfers
+
+    def _process_watch_results(self, results: Sequence[FeedResult]) -> int:
+        cutoff = time.time() - self.settings.watchlist_max_age_minutes * 60
+        entries = sorted(
+            ((item, result.url) for result in results if result.ok for item in result.items
+             if cutoff <= item.published_at <= time.time() + 300),
+            key=lambda entry: entry[0].published_at,
+        )
+        sent = 0
+        for item, feed in entries:
+            try:
+                sent += int(self._process_watch_item(item, feed))
+            except Exception:
+                logger.exception("Failed to process watchlist item %r", item.title)
+        logger.info("Watchlist poll: %d feeds, %d recent items, %d alerts", len(results), len(entries), sent)
+        return sent
+
+    def _process_watch_item(self, item: NewsItem, feed: str) -> bool:
+        if self.storage.has_seen(item.item_hash):
+            return False
+        exchange = {BINANCE_FEED: "Binance", UPBIT_FEED: "Upbit", OKX_FEED: "OKX"}.get(feed)
+        if exchange:
+            ticker = listing_label(item.title, exchange)
+            if not ticker:
+                return False
+            subject = f"Листинг на {exchange} → {ticker}"
+            origin = "Официальное объявление биржи"
+        else:
+            people = match_people(item.text, feed, self.watch_people)
+            if not people:
+                return False
+            subject = " · ".join(f"{p.name} → {p.coins}" for p in people)
+            if feed == "https://trumpstruth.org/feed":
+                origin = "Неофициальная копия поста"
+            elif any(feed in person.feeds for person in people):
+                origin = "Публикация автора"
+            else:
+                origin = "Сообщение СМИ, требует проверки"
+        candidates = self.storage.recent_clusters(item.published_at - self.settings.cluster_window_minutes * 60)
+        cluster_id = find_matching_cluster(
+            item.title, [(c.cluster_id, c.representative_title) for c in candidates
+                         if c.cluster_id.startswith("watch:")], threshold=0.9,
+        ) or "watch:" + new_cluster_id(item.title, item.item_hash[:12])
+        self.storage.upsert_cluster(cluster_id, item.title, item.published_at)
+        if self.storage.is_notified(cluster_id) or self.muted_until():
+            self.storage.mark_seen(item.item_hash, item.source, item.title, item.url, item.published_at, cluster_id)
+            return False
+        if not self.notifier.send(format_watch_alert(item, subject, origin)):
+            logger.warning("Telegram send failed for watchlist item %r; will retry", item.title)
+            return False
+        self.storage.mark_notified(cluster_id)
+        self.storage.mark_seen(item.item_hash, item.source, item.title, item.url, item.published_at, cluster_id)
+        self.storage.record_signal("watch", subject + ": " + item.title, item.url, None, None, 1, None, cluster_id)
+        return True
 
     def _alert_whale_transfers(self, whale_transfers: Sequence[Transfer]) -> None:
         for transfer in whale_transfers:
@@ -1034,11 +1096,13 @@ class GramTonMonitor:
             return None
 
     def run_once(self) -> int:
-        self._safe(self.poll_price)
+        if not self.watchlist_mode:
+            self._safe(self.poll_price)
         notified = self._safe(self.poll_news_once) or 0
         self._safe(self.poll_onchain)
         self._safe(self.poll_futures)
-        self._safe(self.update_signal_followups)
+        if not self.watchlist_mode:
+            self._safe(self.update_signal_followups)
         return notified
 
     def _ensure_command_handler(self) -> None:
@@ -1075,6 +1139,13 @@ class GramTonMonitor:
             logger.error("Telegram rejected the bot token (%s); check TELEGRAM_BOT_TOKEN", self.notifier.last_error)
         # After a few rapid restarts stay quiet: the supervisor keeps trying.
         if self.settings.send_startup_message and self.restart_count < 3:
+            if self.watchlist_mode:
+                self.notifier.send(
+                    f"🤖 Монитор персон запущен · персон: {len(self.watch_people)} · источников: {len(self.watch_feeds)}\n"
+                    "Цена, объём, деривативы и ончейн-алерты выключены.\n"
+                    "/watchlist /status /recent /feeds /help"
+                )
+                return
             self.notifier.send(
                 format_startup(
                     len(self.settings.rss_feeds), self.settings.keywords, self.classifier_name,
@@ -1086,7 +1157,11 @@ class GramTonMonitor:
 
     def run_forever(self) -> int:
         self._install_signal_handlers()
-        logger.info(
+        if self.watchlist_mode:
+            logger.info("Starting watchlist monitor: %d feeds, news every %ss; market, on-chain and futures disabled",
+                        len(self.watch_feeds), self.settings.poll_interval_seconds)
+        else:
+            logger.info(
             "Starting GRAM/TON monitor: %d feeds, classifier=%s, news every %ss (%s), price every %ss, on-chain %s, futures %s",
             len(self.settings.rss_feeds), self.classifier_name,
             self.settings.poll_interval_seconds,
@@ -1095,7 +1170,7 @@ class GramTonMonitor:
             self.settings.price_poll_interval_seconds,
             f"every {self.settings.onchain_poll_interval_seconds}s" if self.onchain_enabled else "disabled",
             f"every {self.settings.futures_poll_interval_seconds}s" if self.futures_enabled else "disabled",
-        )
+            )
         if self.restart_count:
             logger.warning("Restarted by supervisor (%d in a row, last exit code %s)", self.restart_count, self.last_exit_code)
         self.beat()
@@ -1105,7 +1180,7 @@ class GramTonMonitor:
         now = time.monotonic()
         next_news = now
         next_priority = float("inf")  # armed after the first full poll
-        next_price = now
+        next_price = now if not self.watchlist_mode else float("inf")
         next_onchain = now if self.onchain_enabled else float("inf")
         next_futures = now if self.futures_enabled else float("inf")
         next_handler_check = now
@@ -1178,7 +1253,8 @@ def classifier_label(settings: Settings) -> str:
 def build_monitor(settings: Optional[Settings] = None, telegram: bool = True) -> GramTonMonitor:
     settings = settings or Settings.from_env()
     storage = Storage(settings.database_path)
-    source = RSSSource(settings.rss_feeds, timeout=settings.feed_timeout_seconds)
+    feeds = feed_urls(active_people(settings.watchlist_disable), settings.watchlist_aggregators) if settings.news_mode == "watchlist" else settings.rss_feeds
+    source = RSSSource(feeds, timeout=settings.feed_timeout_seconds)
     classifier = build_classifier(settings)
     notifier = TelegramNotifier(
         settings.telegram_bot_token if telegram else "",
