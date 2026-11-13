@@ -174,6 +174,10 @@ DEFAULT_PRIORITY_KEYWORDS = [
 
 @dataclass
 class Settings:
+    news_mode: str = "classic"
+    watchlist_disable: List[str] = field(default_factory=list)
+    watchlist_aggregators: List[str] = field(default_factory=list)
+    watchlist_max_age_minutes: int = 15
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     rss_feeds: List[str] = field(default_factory=lambda: list(DEFAULT_RSS_FEEDS))
@@ -266,8 +270,16 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        from .watchlist import AGGREGATOR_FEEDS
+        mode = (os.getenv("NEWS_MODE") or "watchlist").strip().lower()
+        if mode not in ("watchlist", "classic"):
+            raise ValueError("NEWS_MODE must be watchlist or classic")
         priority_poll = _env_int("PRIORITY_POLL_INTERVAL_SECONDS", 60)
         return cls(
+            news_mode=mode,
+            watchlist_disable=_env_list("WATCHLIST_DISABLE", []),
+            watchlist_aggregators=_env_list("WATCHLIST_AGGREGATOR_FEEDS", list(AGGREGATOR_FEEDS)),
+            watchlist_max_age_minutes=max(1, _env_int("WATCHLIST_MAX_AGE_MINUTES", 15)),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             rss_feeds=_env_list("RSS_FEEDS", DEFAULT_RSS_FEEDS),
@@ -278,7 +290,7 @@ class Settings:
             # 0 disables the fast lane; anything else is clamped to >= 30 s so
             # the Telegram web previews are not hammered.
             priority_poll_interval_seconds=0 if priority_poll <= 0 else max(30, priority_poll),
-            poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 180)),
+            poll_interval_seconds=max(30, _env_int("POLL_INTERVAL_SECONDS", 60 if mode == "watchlist" else 180)),
             price_poll_interval_seconds=max(30, _env_int("PRICE_POLL_INTERVAL_SECONDS", 120)),
             feed_timeout_seconds=max(3, _env_int("FEED_TIMEOUT_SECONDS", 15)),
             max_item_age_hours=max(1, _env_int("MAX_ITEM_AGE_HOURS", 24)),

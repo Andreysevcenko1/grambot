@@ -487,6 +487,14 @@ class Storage:
         row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE sent_at >= ?", (since_ts,))
         return int(row["c"]) if row else 0
 
+    def count_watch_signals(self, since: float = 0.0) -> int:
+        row = self._query_one("SELECT COUNT(*) AS c FROM signals WHERE kind = 'watch' AND sent_at >= ?", (since,))
+        return int(row["c"]) if row else 0
+
+    def recent_watch_signals(self, limit: int = 5) -> List[SignalRecord]:
+        rows = self._query("SELECT * FROM signals WHERE kind = 'watch' ORDER BY sent_at DESC LIMIT ?", (limit,))
+        return [_row_to_signal(row) for row in rows]
+
     def recent_signals(self, limit: int = 5) -> List[SignalRecord]:
         rows = self._query("SELECT * FROM signals ORDER BY sent_at DESC LIMIT ?", (limit,))
         return [_row_to_signal(row) for row in rows]

@@ -111,6 +111,21 @@ def truncate(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def format_watch_alert(item: NewsItem, subject: str, origin: str) -> str:
+    text = item.summary or item.title
+    lines = [
+        f"🔔 <b>{html.escape(subject)}</b>",
+        "",
+        html.escape(truncate(text, 800)),
+        "",
+        f"{html.escape(origin)}: {html.escape(item.source)} · {fmt_time(item.published_at)}",
+    ]
+    if item.url:
+        lines.append(f'<a href="{html.escape(item.url, quote=True)}">Открыть источник</a>')
+    lines.extend(["", DISCLAIMER])
+    return "\n".join(lines)
+
+
 def _window_line(move: PriceMove) -> Optional[str]:
     """``−1,2% за 20 мин · +3,6% за 1 ч · +6,1% за 4 ч`` (24h is shown on the headline line)."""
     parts = []
